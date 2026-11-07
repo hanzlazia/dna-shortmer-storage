@@ -16,6 +16,10 @@ Upload any file, see how it is turned into combinatorial DNA sequences, corrupt 
 | iv–v | `shortmer/channel.py` | molecular simulation (substitutions per nt, insertions/deletions per k-mer, read depth), grouping by barcode, top-K k-mers per position |
 | vi–vii | `shortmer/codec.py` | errors-and-erasures RS decoding, lengthwise then crosswise, padding removal |
 
+Extras: `shortmer/stats.py` (bit counts, A/C/G/T composition, comparison with the simple 2-bit-per-nucleotide mapping, TXT report) and `shortmer/formats.py` (FASTA / FASTQ export).
+
+Reed-Solomon is optional: the sidebar switches lengthwise RS, crosswise RS and barcode RS on or off independently. With everything off, a clean channel is still decoded exactly; any damage is then (correctly) not repaired. The Experiments tab compares No RS / Lengthwise / Crosswise / Both under the same damage.
+
 `shortmer/capacity.py` recomputes the paper's Table 3 (verified in the tests).
 
 ## Run

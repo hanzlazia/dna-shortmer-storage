@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from shortmer import capacity, synthesis
+from shortmer import capacity, formats, stats, synthesis
 from shortmer.alphabet import hamming
 from shortmer.channel import inject_letter_errors, reconstruct, simulate_reads
 from shortmer.codec import (ERASED, KIND_ORDER, LRS, PADDING, PADINFO, PAYLOAD, PRESETS,
@@ -141,12 +141,21 @@ LBL = {
     "k": ("k-mer length", 2, 5), "d": ("min. Hamming distance of Ω", 1, 4),
     "payload_letters": ("payload letters / sequence", 4, 400), "rs_len": ("lengthwise RS parity letters", 0, 60),
     "block_data": ("data sequences / block", 2, 200), "block_parity": ("crosswise RS parity sequences / block", 0, 40),
-    "bc_parity": ("barcode RS parity symbols (GF(16))", 2, 6),
+    "bc_parity": ("barcode RS parity symbols (GF(16))", 0, 6),
 }
 for f in FIELDS:
     lab, lo, hi = LBL[f]
     st.sidebar.number_input(lab, lo, hi, key=f"p_{f}", step=1)
+st.sidebar.header("Error correction (Reed–Solomon)")
+rs_l = st.sidebar.checkbox("Lengthwise RS (inside each sequence)", True)
+rs_x = st.sidebar.checkbox("Crosswise RS (parity sequences per block)", True)
+rs_b = st.sidebar.checkbox("Barcode RS", True)
+if not (rs_l or rs_x or rs_b):
+    st.sidebar.caption("All RS layers are off: the data is stored with no redundancy.")
 params = Params(**{f: int(st.session_state[f"p_{f}"]) for f in FIELDS})
+params = replace(params, rs_len=params.rs_len if rs_l else 0,
+                 block_parity=params.block_parity if rs_x else 0,
+                 bc_parity=params.bc_parity if rs_b else 0)
 seed = int(st.sidebar.number_input("Random seed", 0, 10**6, 1))
 st.sidebar.markdown(
     '<p class="small">Method: I. Preuss, Z. Yakhini, L. Anavy, <i>Data Storage Based on Combinatorial '
@@ -173,8 +182,9 @@ st.caption(f"Encoding **{fname}** ({len(data):,} bytes) with a binomial alphabet
            f"{alpha.k}-mers, K = {alpha.K}  →  |Σ| = C({alpha.N},{alpha.K}) = {alpha.size:,}; "
            f"{r} bits per letter (uses {alpha.usable:,} letters).")
 
-t_over, t_enc, t_syn, t_dec, t_exp, t_cap = st.tabs(
-    ["Workflow", "1 · Encoding", "2 · Synthesis", "3 · Channel and decoding", "Experiments", "Capacity and Ω"])
+t_over, t_enc, t_syn, t_dec, t_files, t_exp, t_cap = st.tabs(
+    ["Workflow", "1 · Encoding", "2 · Synthesis", "3 · Channel and decoding", "4 · FASTA / FASTQ",
+     "Experiments", "Capacity and Ω"])
 
 # ------------------------------------------------------------------ workflow
 with t_over:
@@ -276,6 +286,53 @@ with t_enc:
         "kmer_sets": [" ".join("{" + "|".join(alpha.kmers(v)) + "}" for v in row) for row in enc.matrix]})
     st.download_button("Download design (CSV)", design.to_csv(index=False).encode(),
                        f"{fname}.design.csv", "text/csv")
+
+    st.subheader("Step iv · Bits, nucleotides and comparison with simple binary mapping")
+    S = stats.encoding_stats(enc, data)
+    sm, cb = S["simple"], S["comb"]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Information bits", f"{S['bits']:,}")
+    c2.metric("Stored bits (all letters)", f"{S['parts_total']:,}")
+    c3.metric("Bits / synthesis cycle", f"{S['info_bits_per_cycle']:.2f}", "simple mapping: 2.00", delta_color="off")
+    c4.metric("Cycles vs simple mapping", f"{cb['cycles'] / sm['nt']:.2f}×", f"{S['fold_vs_simple']:.2f}× fewer", delta_color="off")
+    st.markdown("**Simple mapping** assigns 2 bits to every nucleotide (00→A, 01→C, 10→G, 11→T) with no barcodes or "
+                "error correction. **Combinatorial** figures include all overhead (RS, barcodes, padding).")
+    cmp = pd.DataFrame([
+        ("Bits stored per position", "2", f"{r}"),
+        ("Synthesis cycles (total)", f"{sm['nt']:,}", f"{cb['cycles']:,}"),
+        ("Molecules", f"{sm['oligos_same_length']:,} (at {cb['molecule_nt']} nt)", f"{cb['sequences']:,} (each {cb['molecule_nt']} nt)"),
+        ("Information bits per cycle", "2.00", f"{S['info_bits_per_cycle']:.2f}"),
+        ("Error correction", "none", f"lengthwise={params.rs_len}, crosswise={params.block_parity}, barcode={params.bc_parity} parity"),
+        ("Longest homopolymer (simple mapping)", f"{sm['max_homopolymer']}", "n/a (mixtures)"),
+    ], columns=["Metric", "Simple 2-bit mapping", "Combinatorial shortmer"])
+    st.dataframe(cmp, hide_index=True, width="stretch")
+    st.markdown("**Nucleotide counts**")
+    se = cb["total_expected"]
+    comp = pd.DataFrame({
+        "": ["Simple mapping (exact)", "Combinatorial: barcodes (exact)",
+             "Combinatorial: payload (expected)", "Combinatorial: total (expected)"],
+        **{nt: [sm["counts"][nt], cb["barcode_counts"][nt], round(cb["payload_expected"][nt], 1), round(se[nt], 1)]
+           for nt in "ACGT"},
+        "Total nt": [sm["nt"], sum(cb["barcode_counts"].values()), round(sum(cb["payload_expected"].values()), 1),
+                     round(sum(se.values()), 1)],
+        "GC %": [round(stats.gc(sm["counts"]), 1), round(stats.gc(cb["barcode_counts"]), 1),
+                 round(stats.gc(cb["payload_expected"]), 1), round(stats.gc(se), 1)],
+    })
+    st.dataframe(comp, hide_index=True, width="stretch")
+    st.caption("Every molecule picks one k-mer per letter at random, so payload composition is an expectation over "
+               "the mixture. Exact molecules are in the FASTA / FASTQ tab.")
+    st.markdown("**Where the stored bits go**")
+    parts = pd.DataFrame({"component": list(S["parts"]), "bits": list(S["parts"].values())})
+    parts["share (%)"] = (100 * parts["bits"] / S["parts_total"]).round(2)
+    c1, c2 = st.columns([1, 1])
+    c1.dataframe(parts, hide_index=True, width="stretch")
+    c2.altair_chart(alt.Chart(parts).mark_bar().encode(
+        y=alt.Y("component:N", sort="-x", title=None), x=alt.X("bits:Q"),
+        tooltip=list(parts.columns)).properties(height=190), width="stretch")
+    with st.expander("First 48 bits under the simple mapping"):
+        st.code(f"bits : {sm['preview_bits']}\nnt   : {sm['preview_nt']}", language="text")
+    st.download_button("Download encoding report (TXT)", stats.report_text(enc, data, fname).encode(),
+                       f"{fname}.report.txt", "text/plain")
 
 # ------------------------------------------------------------------ synthesis
 with t_syn:
@@ -402,6 +459,45 @@ with t_dec:
     if rep.ok and rep.recovered is not None:
         st.download_button("Download recovered file", rep.recovered, f"recovered_{fname}")
 
+# ------------------------------------------------------------------ files
+with t_files:
+    st.subheader("Export to FASTA and FASTQ")
+    st.markdown("A combinatorial letter is a *mixture* of k-mers, so a sequence has no single DNA string. The files "
+                "contain concrete molecules drawn from the mixtures, as synthesis would produce them: "
+                "**barcode + one random k-mer per letter**.")
+    c1, c2 = st.columns(2)
+    copies = c1.slider("Molecules per sequence in the pool FASTA", 1, 20, 3)
+    fq_depth = c2.slider("Reads per barcode in the FASTQ", 1, 200, 20)
+    c1, c2, c3 = st.columns(3)
+    fq_sub = c1.select_slider("FASTQ substitution rate / nt", [0, 1e-4, 1e-3, 5e-3, 1e-2], 1e-3, format_func=lambda x: f"{x:g}", key="fq_s")
+    fq_ins = c2.select_slider("FASTQ insertion rate / k-mer", [0, 1e-4, 1e-3, 5e-3], 0, format_func=lambda x: f"{x:g}", key="fq_i")
+    fq_del = c3.select_slider("FASTQ deletion rate / k-mer", [0, 1e-4, 1e-3, 5e-3], 0, format_func=lambda x: f"{x:g}", key="fq_d")
+    design_recs = formats.design_records(enc, np.random.default_rng(seed + 7), 1)
+    pool_recs = formats.design_records(enc, np.random.default_rng(seed + 8), copies)
+    reads_fq, _ = simulate_reads(enc, np.random.default_rng(seed + 9), depth=fq_depth, p_sub=fq_sub, p_ins=fq_ins, p_del=fq_del)
+    recs = [(f"read{i + 1:07d}", formats.read_to_nt(b, p_, alpha.k)) for i, (b, p_) in enumerate(reads_fq)]
+    fa_design, fa_pool, fq = formats.to_fasta(design_recs), formats.to_fasta(pool_recs), formats.to_fastq(recs)
+    mol_len = enc.nb * 2 + params.bc_parity * 2 + params.width * alpha.k
+    st.dataframe(pd.DataFrame([
+        ("FASTA: design", len(design_recs), f"{mol_len} nt", "one molecule per sequence"),
+        ("FASTA: pool", len(pool_recs), f"{mol_len} nt", f"{copies} independent molecules per sequence"),
+        ("FASTQ: reads", len(recs), "about the same (indels change length)",
+         f"about {fq_depth} reads per barcode, constant quality Q40 ('I')"),
+    ], columns=["File", "Records", "Length", "Content"]), hide_index=True, width="stretch")
+    cnt = stats.composition("".join(s_ for _, s_ in design_recs))
+    st.markdown("**Nucleotide counts of the design FASTA**: " + " · ".join(
+        f"{nt} = {cnt[nt]:,}" for nt in "ACGT") + f" · GC = {stats.gc(cnt):.1f}%")
+    d1, d2, d3, d4 = st.columns(4)
+    d1.download_button("Design (FASTA)", fa_design.encode(), f"{fname}.design.fasta", "text/plain")
+    d2.download_button("Pool (FASTA)", fa_pool.encode(), f"{fname}.pool.fasta", "text/plain")
+    d3.download_button("Reads (FASTQ)", fq.encode(), f"{fname}.reads.fastq", "text/plain")
+    d4.download_button("Report (TXT)", stats.report_text(enc, data, fname).encode(), f"{fname}.report.txt", "text/plain")
+    with st.expander("Preview"):
+        st.code("\n".join(fa_design.splitlines()[:6]), language="text")
+        st.code("\n".join(fq.splitlines()[:8]), language="text")
+    st.caption("FASTQ qualities are constant: the simulator does not model per-base confidence. Barcodes are the "
+               f"first {(enc.nb + params.bc_parity) * 2} nt of each read.")
+
 # ------------------------------------------------------------------ experiments
 with t_exp:
     st.subheader("Reconstruction rate versus error rate and sequencing depth")
@@ -440,6 +536,54 @@ with t_exp:
                             scale=alt.Scale(scheme="blues")),
             tooltip=list(df.columns)).properties(height=320), width="stretch")
         st.dataframe(df.pivot(index="reads", columns="error rate", values="full recovery (%)"), width="stretch")
+
+    st.divider()
+    st.subheader("What does Reed–Solomon buy? (RS on / off)")
+    st.markdown("Same input, same damage, four designs. Letters are corrupted at random and whole sequences dropped; "
+                "each design is re-encoded (RS adds redundant sequences) and decoded. At most the first 5 KB are used.")
+    c1, c2, c3 = st.columns(3)
+    a_err = c1.select_slider("Letter error rate", [0, 0.001, 0.003, 0.01, 0.03], 0.003, format_func=lambda x: f"{x:.1%}")
+    a_loss = c2.select_slider("Sequence loss rate", [0, 0.01, 0.03, 0.05, 0.1], 0.03, format_func=lambda x: f"{x:.0%}")
+    a_trials = c3.slider("Trials", 1, 20, 8, key="abl_trials")
+    if st.button("Compare designs"):
+        sub = data[:5000]
+        rows_out = []
+        on_l = params.rs_len or 6
+        on_x = params.block_parity or 4
+        for label, rl, xp in [("No RS", 0, 0), ("Lengthwise only", on_l, 0),
+                              ("Crosswise only", 0, on_x), ("Both", on_l, on_x)]:
+            pp = replace(params, rs_len=rl, block_parity=xp)
+            try:
+                e3 = encode(sub, pp)
+            except ValueError as ex:
+                rows_out.append({"design": label, "note": str(ex)})
+                continue
+            good, badbytes = 0, []
+            for t in range(a_trials):
+                g = np.random.default_rng(seed * 100 + t)
+                inj = inject_letter_errors(e3, g, random_errors=round(a_err * e3.total_rows * pp.width),
+                                           lose_rows=round(a_loss * e3.total_rows))
+                rp = decode(inj.received, pp, e3.alphabet)
+                if rp.ok and rp.recovered == sub:
+                    good += 1
+                    badbytes.append(0)
+                elif rp.ok:
+                    badbytes.append(sum(a != b for a, b in zip(rp.recovered, sub)) + abs(len(rp.recovered) - len(sub)))
+                else:
+                    badbytes.append(len(sub))
+            raw_rows = ceil(len(sub) * 8 / (pp.payload_letters * e3.alphabet.bits))
+            rows_out.append({"design": label, "sequences": e3.total_rows,
+                             "overhead vs no RS": f"{e3.total_rows / raw_rows:.2f}×",
+                             "full recovery (%)": round(100 * good / a_trials),
+                             "mean wrong bytes": round(float(np.mean(badbytes)), 1)})
+        dfa = pd.DataFrame(rows_out)
+        st.dataframe(dfa, hide_index=True, width="stretch")
+        if "full recovery (%)" in dfa:
+            st.altair_chart(alt.Chart(dfa.dropna(subset=["full recovery (%)"])).mark_bar().encode(
+                x=alt.X("design:N", sort=None, title=None), y=alt.Y("full recovery (%):Q", scale=alt.Scale(domain=[0, 100])),
+                color=alt.value("#33414f"), tooltip=list(dfa.columns)).properties(height=260), width="stretch")
+        st.caption("Without RS any letter error or lost sequence corrupts the file; with a clean channel it is "
+                   "recovered exactly (see the decoder tab).")
 
 # ------------------------------------------------------------------ capacity
 with t_cap:

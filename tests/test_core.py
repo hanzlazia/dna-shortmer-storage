@@ -122,3 +122,68 @@ def test_molecular_channel_clean_and_noisy():
     mat, st = reconstruct(reads, p, enc.alphabet, st, enc.total_rows)
     rep = decode(mat, p, enc.alphabet)
     assert rep.ok and rep.recovered == data
+
+
+# ---- optional RS, statistics, exports -------------------------------------
+from shortmer import formats, stats
+from dataclasses import replace
+
+
+@pytest.mark.parametrize("lr,xr,bc", [(0, 0, 0), (6, 0, 2), (0, 4, 2), (6, 4, 0)])
+def test_rs_can_be_disabled_and_clean_data_still_decodes(lr, xr, bc):
+    p = replace(Params(), rs_len=lr, block_parity=xr, bc_parity=bc)
+    data = bytes(range(200)) * 2
+    enc = encode(data, p)
+    rep = decode([list(r) for r in enc.matrix], p, enc.alphabet)
+    assert rep.ok and rep.recovered == data
+
+
+def test_without_rs_errors_are_not_repaired_but_with_rs_they_are():
+    data = bytes(range(256)) * 2
+    rng = np.random.default_rng(3)
+    off = replace(Params(), rs_len=0, block_parity=0)
+    e0 = encode(data, off)
+    inj = inject_letter_errors(e0, rng, random_errors=3)
+    rep = decode(inj.received, off, e0.alphabet)
+    assert not (rep.ok and rep.recovered == data)
+    on = Params()
+    e1 = encode(data, on)
+    inj = inject_letter_errors(e1, rng, random_errors=3)
+    rep = decode(inj.received, on, e1.alphabet)
+    assert rep.ok and rep.recovered == data
+
+
+def test_no_rs_molecular_clean_roundtrip():
+    p = replace(Params(), rs_len=0, block_parity=0, bc_parity=0)
+    data = b"no error correction at all " * 20
+    enc = encode(data, p)
+    reads, st = simulate_reads(enc, np.random.default_rng(0), depth=80, p_sub=0, p_ins=0, p_del=0)
+    mat, st = reconstruct(reads, p, enc.alphabet, st, enc.total_rows)
+    rep = decode(mat, p, enc.alphabet)
+    assert rep.ok and rep.recovered == data
+
+
+def test_simple_mapping_and_stats():
+    assert stats.simple_dna(b"\x1b") == "ACGT"          # 00 01 10 11
+    data = bytes(range(100))
+    enc = encode(data, Params())
+    s = stats.encoding_stats(enc, data)
+    assert s["bits"] == 800 and s["simple"]["nt"] == 400
+    assert sum(s["simple"]["counts"].values()) == 400
+    assert abs(sum(s["comb"]["total_expected"].values()) - s["comb"]["total_nt"]) < 1e-6
+    assert s["parts_total"] == enc.total_rows * enc.params.width * enc.alphabet.bits
+    assert "Combinatorial" in stats.report_text(enc, data, "x.bin")
+
+
+def test_fasta_fastq_exports():
+    enc = encode(b"abc" * 50, Params())
+    rng = np.random.default_rng(0)
+    recs = formats.design_records(enc, rng, copies=2)
+    assert len(recs) == 2 * enc.total_rows
+    L = enc.params.width * enc.alphabet.k + len(enc.barcodes[0])
+    assert all(len(s) == L and set(s) <= set("ACGT") for _, s in recs)
+    fa, fq = formats.to_fasta(recs), formats.to_fastq(recs)
+    assert fa.count(">") == len(recs) and fq.count("\n+\n") == len(recs)
+    reads, _ = simulate_reads(enc, rng, depth=2, p_sub=0, p_ins=0, p_del=0)
+    s = formats.read_to_nt(*reads[0], enc.alphabet.k)
+    assert len(s) == L

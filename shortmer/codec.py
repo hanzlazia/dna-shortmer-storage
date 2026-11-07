@@ -167,8 +167,6 @@ def encode(data: bytes, p: Params) -> Encoded:
         raise ValueError(f"sequence length {W} exceeds RS limit 2^{r}-1")
     if p.block_size > (1 << r) - 1:
         raise ValueError("block too large for the field")
-    if p.bc_parity < 2:
-        raise ValueError("barcode needs >= 2 parity symbols")
 
     bits = bytes_to_bits(data)
     bit_pad = (-len(bits)) % r
