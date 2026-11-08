@@ -92,6 +92,40 @@ def shrink_image(data: bytes, max_side: int, quality: int) -> bytes:
     return buf.getvalue()
 
 
+def shrink_av(data: bytes, name: str, kind: str, a: int, b: int) -> bytes:
+    """audio: a = kbit/s;  video: a = width in pixels, b = CRF (higher = smaller). Needs ffmpeg."""
+    import os, shutil, subprocess, tempfile
+    try:
+        import imageio_ffmpeg
+        ff = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        ff = shutil.which("ffmpeg")
+    if not ff:
+        raise RuntimeError("ffmpeg not available")
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "in" + (os.path.splitext(name)[1] or ".bin"))
+        open(src, "wb").write(data)
+        if kind == "audio":
+            out = os.path.join(d, "out.mp3")
+            cmd = [ff, "-y", "-i", src, "-vn", "-ac", "1", "-ar", "22050", "-b:a", f"{a}k", out]
+        else:
+            out = os.path.join(d, "out.mp4")
+            cmd = [ff, "-y", "-i", src, "-vf", f"scale='min({a},iw)':-2", "-c:v", "libx264", "-crf", str(b), "-preset", "veryfast",
+                   "-c:a", "aac", "-b:a", "32k", "-ac", "1", "-movflags", "+faststart", out]
+        subprocess.run(cmd, check=True, capture_output=True, timeout=300)
+        return open(out, "rb").read()
+
+
+def safe_limit(cap: int):
+    """Largest file (bytes) that this app can store AND read back exactly, and the copies needed for it."""
+    best = (0, 0)
+    for c in range(20, 301):
+        strands = cap // c
+        if C.miss_probability(c) * strands * C.LPS < 0.1 and strands * 180 > best[0]:
+            best = (strands * 180, c)
+    return best
+
+
 def sha16(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()[:16]
 
@@ -136,32 +170,47 @@ with c2: meta_table(oname, orig)
 
 # ---------------------------------------------------------------- 2 compress
 step(2, "Compress the file (optional)")
-is_img = (mimetypes.guess_type(oname)[0] or "").startswith("image")
-modes = ["No compression", "Lossless compression (LZMA) - any file, exact recovery"]
-if is_img:
-    modes.append("Shrink the image (lossy JPEG) - smaller picture, much fewer DNA strands")
+kind = (mimetypes.guess_type(oname)[0] or "").split("/")[0]
+modes = ["No compression", "Lossless compression (LZMA) - exact recovery. Does NOT help files that are already compressed (JPEG, MP3, MP4, ZIP)"]
+if kind in ("image", "audio", "video"):
+    modes.append(f"Shrink the {kind} (lossy) - real size reduction, quality is reduced")
 mode = st.radio("Compression", modes, label_visibility="collapsed")
 payload, pname, comp = orig, oname, "none"
 if mode.startswith("Lossless"):
     payload, comp = lzma.compress(orig, preset=9 | lzma.PRESET_EXTREME), "lzma"
 elif mode.startswith("Shrink"):
     q1, q2 = st.columns(2)
-    side = q1.slider("Longest side (pixels)", 64, 3000, 640)
-    qual = q2.slider("JPEG quality", 5, 95, 40)
+    stem = oname.rsplit(".", 1)[0]
     try:
-        payload = shrink_image(orig, side, qual)
-        pname = oname.rsplit(".", 1)[0] + "_small.jpg"
-    except Exception:
-        st.error("This image could not be opened for shrinking."); payload = orig
+        if kind == "image":
+            side = q1.slider("Longest side (pixels)", 64, 3000, 640); qual = q2.slider("JPEG quality", 5, 95, 40)
+            payload, pname = shrink_image(orig, side, qual), stem + "_small.jpg"
+        elif kind == "audio":
+            kbps = q1.slider("Bitrate (kbit/s)", 8, 128, 24, help="Mono, 22 kHz MP3. Lower = smaller file, worse sound.")
+            payload, pname = shrink_av(orig, oname, "audio", kbps, 0), stem + "_small.mp3"
+        else:
+            width = q1.slider("Video width (pixels)", 96, 1280, 240); crf = q2.slider("Quality loss (CRF, higher = smaller)", 18, 45, 36)
+            payload, pname = shrink_av(orig, oname, "video", width, crf), stem + "_small.mp4"
+    except Exception as e:
+        st.error(f"Could not shrink this {kind} ({type(e).__name__}). Choose another option."); payload = orig
 psha = sha16(payload)
 k1, k2, k3 = st.columns(3)
 k1.metric("Original", f"{len(orig):,} bytes")
 k2.metric("To be stored in DNA", f"{len(payload):,} bytes", f"{(len(payload) / len(orig) - 1):+.0%}" if len(payload) != len(orig) else None, delta_color="off")
 k3.metric("Bits", f"{len(payload) * 8:,}")
 if mode.startswith("Shrink"):
-    preview(payload, pname)
+    st.markdown("**Shrunk file (this is what will be stored in DNA)**"); preview(payload, pname)
+elif comp == "lzma":
+    st.caption("LZMA output is just compressed bytes, not a playable/viewable file, so there is nothing to preview here. "
+               "After decoding it is decompressed and you will see the original again in Step 6." +
+               (" Almost no gain here: this file type is already compressed." if len(payload) > 0.9 * len(orig) else ""))
+cap_bytes, cap_copies = safe_limit(MAX_READS)
+if len(payload) > cap_bytes:
+    st.warning(f"This app can store and exactly recover files up to about **{cap_bytes // 1000} KB** (needs ≈ {cap_copies} copies per strand). "
+               f"The file to be stored is {len(payload) // 1000} KB. Use a lossy shrink option above to get below that.")
 b1, b2 = st.columns(2)
-b1.download_button("Download binary (.bin)", payload, file_name=pname + ".bin", on_click="ignore", help="The bytes that will be written into DNA.")
+if payload != orig:
+    b1.download_button("Download compressed file", payload, file_name=pname if comp == "none" else pname + ".lzma", on_click="ignore")
 if len(payload) <= 3_000_000:
     b2.download_button("Download bits (0/1 text)", lambda: "".join(map(str, np.unpackbits(np.frombuffer(payload, np.uint8)))).encode(),
                        file_name=pname + "_bits.txt", on_click="ignore")
@@ -191,9 +240,12 @@ n_reads = n_strands * copies
 miss = C.miss_probability(copies)
 st.caption(f"**{n_reads:,}** molecules. A letter misses at least one of its 5 trimers with probability **{miss:.2%}** → about "
            f"**{miss * n_letters:,.0f}** of {n_letters:,} letters unreadable even with no errors (≈ 11.4 copies needed on average).")
+if miss * n_letters >= 0.5:
+    st.warning(f"With {copies} copies about {miss * n_letters:,.0f} letters will be unreadable, so the recovered file will be damaged "
+               f"(an audio/video/image may not play). Use more copies or a smaller file (Step 2).")
 if n_reads > MAX_READS:
     st.error(f"{n_reads:,} molecules is more than this app can handle ({MAX_READS:,}). With {copies} copies the file to store must be at most "
-             f"**{MAX_READS // copies * C.LPS * 12 // 8:,} bytes**. Use Step 2 (compression / shrink image) or fewer copies.")
+             f"**{MAX_READS // copies * C.LPS * 12 // 8:,} bytes**. Use Step 2 (shrink) or fewer copies (but then letters go unreadable).")
     st.stop()
 clean = get_clean(psha, letters, copies, int(seed))
 v1, v2, v3 = st.columns(3)
@@ -270,6 +322,8 @@ if dec and dec["key"] == key:
         except Exception:
             st.error("The compressed data is damaged and cannot be decompressed (too many unreadable letters). Showing the raw bytes instead.")
             fname = fname + ".lzma"
+    if not same:
+        st.warning("The recovered file is damaged, so a player may refuse to open it. Fix: more copies, fewer errors, or a smaller file.")
     p1, p2 = st.columns(2)
     with p1:
         st.subheader("Original"); preview(orig, oname); meta_table(oname, orig)
