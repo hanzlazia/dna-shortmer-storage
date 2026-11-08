@@ -34,9 +34,16 @@ def letters_to_bytes(letters: np.ndarray, n_bytes: int) -> bytes:
     return np.packbits(bits).tobytes()[:n_bytes]
 
 
+def barcode_digits(ids: np.ndarray) -> np.ndarray:
+    """Strand number in base 4 (11 nt) + 1 parity nt (sum of digits mod 4). Two valid barcodes always differ in at
+    least 2 positions, so ONE substitution in a barcode can never give another valid barcode."""
+    ids = np.asarray(ids)[..., None]
+    dig = ((ids >> (2 * np.arange(BARCODE_LEN - 2, -1, -1))) & 3).astype(np.uint8)
+    return np.concatenate([dig, (dig.sum(axis=-1, keepdims=True) % 4).astype(np.uint8)], axis=-1)
+
+
 def barcode(i: int) -> str:
-    """Standard-DNA barcode: strand number written in base 4 (A,C,G,T)."""
-    return "".join("ACGT"[(i >> (2 * s)) & 3] for s in range(BARCODE_LEN - 1, -1, -1))
+    return "".join("ACGT"[d] for d in barcode_digits(np.array(i)))
 
 
 def letter_trimers(letter: int) -> list[str]:
@@ -61,9 +68,9 @@ def miss_probability(copies: int) -> float:
     return float(sum((-1) ** (j + 1) * comb(K, j) * (1 - j / K) ** copies for j in range(1, K + 1)))
 
 
-def make_reads(letters: np.ndarray, copies: int, p_sub: float, seed: int = 1):
+def make_reads(letters: np.ndarray, copies: int, p_sub: float = 0.0, seed: int = 1):
     """Synthesize `copies` molecules per strand: every molecule takes ONE random trimer of the letter's 5 at each
-    position. Then each nucleotide is substituted by a different base with probability p_sub.
+    position (optionally with substitutions, see add_substitutions).
     Returns (reads as ASCII matrix [n_strands*copies, READ_LEN], strand id of every read)."""
     rng = np.random.default_rng(seed)
     n = len(letters) // LPS
@@ -71,8 +78,7 @@ def make_reads(letters: np.ndarray, copies: int, p_sub: float, seed: int = 1):
     pick = rng.integers(0, K, size=(n, copies, LPS, 1))
     tri = np.take_along_axis(np.broadcast_to(sub[:, None], (n, copies, LPS, K)), pick, axis=3)[..., 0]
     pay = TRI_BASES[tri].reshape(n, copies, 3 * LPS)
-    ids = np.arange(n)[:, None]
-    bc = ((ids >> (2 * np.arange(BARCODE_LEN - 1, -1, -1))) & 3).astype(np.uint8)  # (n, 12)
+    bc = barcode_digits(np.arange(n))                                             # (n, 12)
     seq = np.concatenate([np.broadcast_to(bc[:, None, :], (n, copies, BARCODE_LEN)), pay], axis=2)
     seq = np.ascontiguousarray(seq.reshape(n * copies, READ_LEN), dtype=np.uint8)
     flat = seq.reshape(-1)
@@ -83,6 +89,24 @@ def make_reads(letters: np.ndarray, copies: int, p_sub: float, seed: int = 1):
     return ASCII[seq], np.repeat(np.arange(n), copies)
 
 
+_IDX = np.full(256, 0, np.uint8)
+for _i, _ch in enumerate(b"ACGT"):
+    _IDX[_ch] = _i
+
+
+def add_substitutions(reads: np.ndarray, p_sub: float, seed: int = 1):
+    """Each nucleotide is replaced by a DIFFERENT base with probability p_sub. Returns (new reads, bases changed)."""
+    out = reads.copy()
+    if p_sub <= 0:
+        return out, 0
+    rng = np.random.default_rng(seed + 12345)
+    flat = out.reshape(-1)
+    n_err = int(rng.binomial(flat.size, p_sub))
+    pos = np.unique(rng.integers(0, flat.size, n_err))
+    flat[pos] = ASCII[(_IDX[flat[pos]] + rng.integers(1, 4, len(pos))) % 4]
+    return out, len(pos)
+
+
 def spaced(reads: np.ndarray) -> np.ndarray:
     """barcode + space + trimers separated by spaces (for reading by eye / CSV)."""
     m = len(reads)
@@ -91,11 +115,11 @@ def spaced(reads: np.ndarray) -> np.ndarray:
     return np.concatenate([bc, np.full((m, 1), 32, np.uint8), tri.reshape(m, 4 * LPS)[:, :-1]], axis=1)
 
 
-def to_fastq(reads: np.ndarray, copies: int, name: str, n_bytes: int, sha16: str) -> bytes:
+def to_fastq(reads: np.ndarray, copies: int, meta: dict) -> bytes:
     from urllib.parse import quote
-    meta = f" name={quote(name)} bytes={n_bytes} sha={sha16}".encode()
+    mt = " ".join(f"{k}={quote(str(v))}" for k, v in meta.items()).encode()
     qual = b"I" * READ_LEN
-    return b"".join(b"@S%06d_C%03d%s\n%s\n+\n%s\n" % (k // copies, k % copies, meta, reads[k].tobytes(), qual)
+    return b"".join(b"@S%06d_C%03d %s\n%s\n+\n%s\n" % (k // copies, k % copies, mt, reads[k].tobytes(), qual)
                     for k in range(len(reads)))
 
 
@@ -122,8 +146,9 @@ def parse_fastq(raw: bytes):
     lines = raw.replace(b"\r", b"").split(b"\n")
     seqs = [x.strip().upper() for x in lines[1::4]]
     good = [x for x in seqs if len(x) == READ_LEN]
-    mt = re.search(rb"name=(\S+) bytes=(\d+) sha=(\w+)", lines[0]) if lines else None
-    meta = {"name": unquote(mt.group(1).decode()), "bytes": int(mt.group(2)), "sha": mt.group(3).decode()} if mt else {}
+    meta = {k.decode(): unquote(v.decode()) for k, v in re.findall(rb"(\w+)=(\S+)", lines[0])} if lines else {}
+    if "bytes" in meta:
+        meta["bytes"] = int(meta["bytes"])
     reads = np.frombuffer(b"".join(good), dtype=np.uint8).reshape(-1, READ_LEN) if good else np.zeros((0, READ_LEN), np.uint8)
     return reads, meta, len(seqs) - len(good)
 
@@ -142,37 +167,24 @@ for _i, _ch in enumerate(b"ACGT"):
 def decode_reads(reads: np.ndarray, n_bytes: int | None, correct: bool, chunk: int = 1500):
     """Group molecules by barcode, vote the trimers seen at each position, rebuild the letters.
     correct=False: a position is valid only if exactly 5 Omega trimers were seen and nothing else.
-    correct=True : barcode repaired (1 substitution); reads whose trimer is not in Omega are ignored (d = 2 lets a
+    correct=True : barcode parity checked (bad barcodes dropped); reads whose trimer is not in Omega are ignored (d = 2 lets a
                    single substitution always be detected); the 5 most-voted trimers are the letter."""
     m = len(reads)
     v = _LUT[reads]
-    bc_ok = (v[:, :BARCODE_LEN] < 4).all(axis=1)
-    bc = (v[:, :BARCODE_LEN].astype(np.int64) << (2 * np.arange(BARCODE_LEN - 1, -1, -1))).sum(axis=1)
+    dig = v[:, :BARCODE_LEN].astype(np.int64)
+    bc_ok = (dig < 4).all(axis=1)
+    if correct:                                   # parity nucleotide: a single substitution in the barcode is detected
+        bc_ok &= (dig[:, :-1].sum(axis=1) % 4) == dig[:, -1]
+    bc = (dig[:, :-1] << (2 * np.arange(BARCODE_LEN - 2, -1, -1))).sum(axis=1)
     bc[~bc_ok] = -1
-    st = {"reads_in": m, "bad_barcode": 0, "repaired_barcodes": 0, "ignored_trimers": 0}
-
-    uniq, cnt = np.unique(bc[bc >= 0], return_counts=True)
-    if len(cnt) == 0:
-        raise ValueError("No readable molecules.")
-    major = uniq[cnt >= max(2, 0.5 * np.median(cnt))] if correct else uniq
+    st = {"reads_in": m, "bad_barcode": 0, "ignored_trimers": 0}
     if n_bytes is not None:
         n_strands = n_strands_for(n_bytes)
     else:
-        n_strands = int((major if len(major) else uniq).max()) + 1
-    if correct:
-        minor = np.setdiff1d(uniq, major)
-        if len(minor):
-            digs = np.arange(BARCODE_LEN)
-            cand = (minor[:, None, None] ^ (np.arange(1, 4)[None, :, None] << (2 * digs)[None, None, :])).reshape(len(minor), -1)
-            hit = np.isin(cand, major)
-            ok = hit.sum(axis=1) == 1
-            fix = np.where(ok, cand[np.arange(len(minor)), hit.argmax(axis=1)], -1)
-            pos = np.searchsorted(minor, bc)
-            pos[pos >= len(minor)] = 0
-            is_min = (bc >= 0) & (minor[pos] == bc)
-            newbc = np.where(is_min, fix[pos], bc)
-            st["repaired_barcodes"] = int((is_min & (newbc >= 0)).sum())
-            bc = newbc
+        uniq, cnt = np.unique(bc[bc >= 0], return_counts=True)
+        if len(cnt) == 0:
+            raise ValueError("No readable molecules.")
+        n_strands = int(uniq[cnt >= max(2, 0.5 * np.median(cnt))].max()) + 1
     keep = (bc >= 0) & (bc < n_strands)
     st["bad_barcode"] = int(m - keep.sum())
 

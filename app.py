@@ -1,5 +1,7 @@
 """Encode a file into combinatorial shortmer DNA (Preuss, Yakhini & Anavy 2021), download it, edit it, decode it."""
 import hashlib
+import io
+import lzma
 import math
 import mimetypes
 import numpy as np
@@ -73,151 +75,206 @@ def meta_table(name: str, data: bytes):
 
 
 @st.cache_data(max_entries=2, show_spinner="Synthesizing molecules...")
-def get_reads(sha: str, _letters, copies: int, p: float, seed: int):
-    return C.make_reads(_letters, copies, p, seed)
+def get_clean(sha: str, _letters, copies: int, seed: int):
+    return C.make_reads(_letters, copies, 0.0, seed)[0]
 
 
-# ------------------------------------------------------------------ header
-st.title("Combinatorial Shortmer DNA Storage")
-st.image(helix_svg(), width='stretch')
-st.image(pipeline_svg(), width='stretch')
-tab_enc, tab_dec = st.tabs(["1 · Encode", "2 · Decode"])
+@st.cache_data(max_entries=2, show_spinner="Introducing errors...")
+def get_noisy(sha: str, copies: int, seed: int, p: float, _clean):
+    return C.add_substitutions(_clean, p, seed)
 
-# ================================================================== ENCODE
-with tab_enc:
-    up = st.file_uploader("Upload any file (image, audio, video, text, ...)")
-    if up is None:
-        data, name = b"DNA storage with combinatorial shortmers.", "sample.txt"
-        st.caption("No file uploaded: a short sample text is used.")
-    else:
-        data, name = up.getvalue(), up.name
-    if not data:
-        st.warning("The file is empty."); st.stop()
-    sha = hashlib.sha256(data).hexdigest()
-    letters = C.bytes_to_letters(data)
-    n_letters, n_strands = len(letters), len(letters) // C.LPS
 
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        st.subheader("Your file"); preview(data, name)
-    with c2:
-        st.subheader("File metadata"); meta_table(name, data)
-        m1, m2 = st.columns(2)
-        m1.metric("Bits", f"{len(data) * 8:,}"); m2.metric("Letters (12 bits)", f"{n_letters:,}")
-        m1.metric("Strands (120 letters)", f"{n_strands:,}"); m2.metric("Bits per nucleotide", f"{C.BITS / 3:.0f}", help="Standard DNA: 2")
+def shrink_image(data: bytes, max_side: int, quality: int) -> bytes:
+    from PIL import Image
+    im = Image.open(io.BytesIO(data)).convert("RGB")
+    im.thumbnail((max_side, max_side))
+    buf = io.BytesIO(); im.save(buf, "JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
 
-    st.subheader("Omega: the 16 trimers (paper Table 1)")
-    st.markdown(" ".join(f"<small>X{i + 1}</small>{chip(t)}" for i, t in enumerate(C.OMEGA)), unsafe_allow_html=True)
 
-    st.subheader("Synthesis settings")
-    s1, s2, s3 = st.columns(3)
-    copies = s1.slider("Copies (molecules) per strand", 1, 300, 60,
-                       help="Each letter has 5 trimers. Each molecule carries only ONE of them at every position, so many copies are needed to see all 5.")
-    p_sub = s2.slider("Substitution error per nucleotide (%)", 0.0, 5.0, 0.5, 0.1) / 100
-    seed = s3.number_input("Random seed", 0, 10_000, 1)
-    n_reads = n_strands * copies
-    miss = C.miss_probability(copies)
-    st.caption(f"**{n_reads:,}** molecules in total.  A letter misses at least one of its 5 trimers with probability "
-               f"**{miss:.2%}**  →  expect about **{miss * n_letters:,.0f}** of {n_letters:,} letters to be unreadable even without errors "
-               f"(≈ {C.K * sum(1 / i for i in range(1, C.K + 1)):.1f} copies are needed on average, more for safety).")
-    too_big = n_reads > MAX_READS
-    if too_big:
-        st.error(f"{n_reads:,} molecules is too many for this app (limit {MAX_READS:,}). Lower the copies or use a smaller file "
-                 f"(at most {MAX_READS // max(copies, 1) * C.LPS * 12 // 8:,} bytes with {copies} copies).")
-        reads = strand_ids = None
-    else:
-        reads, strand_ids = get_reads(sha, letters, copies, p_sub, int(seed))
-        st.session_state["enc"] = dict(sha=sha, name=name, data=data, copies=copies, reads=reads)
+def sha16(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()[:16]
 
-    st.subheader("The encoding, letter by letter")
-    bits = np.unpackbits(np.frombuffer(data[:10], dtype=np.uint8))
-    rows = [{"Position": i, "12 bits": "".join(map(str, np.pad(bits, (0, 96))[12 * i:12 * i + 12])), "Letter number": int(letters[i]),
-             "Letter = 5 trimers": " ".join(C.letter_trimers(int(letters[i]))),
-             "As Omega indices": " ".join(f"X{j + 1}" for j in C.SUBSETS[letters[i]])} for i in range(6)]
-    st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch')
 
-    st.subheader("A strand: the letter (5 trimers) and the molecules made from it")
-    v1, v2, v3 = st.columns(3)
-    sidx = v1.number_input("Strand number", 0, n_strands - 1, 0)
-    npos = v2.slider("Positions to show", 3, 16, 8)
-    nmol = v3.slider("Molecules to show", 1, 15, min(8, copies))
-    if reads is not None:
-        mol = reads[sidx * copies: sidx * copies + nmol]
-    else:
-        mol, _ = C.make_reads(letters[sidx * C.LPS:(sidx + 1) * C.LPS], copies, p_sub, int(seed))
-        mol = mol[:nmol]; st.caption("(sample only - not part of any download)")
+def viewer(reads, letters, copies, sidx, npos, nmol):
+    mol = reads[sidx * copies: sidx * copies + nmol]
     lt = letters[sidx * C.LPS: sidx * C.LPS + npos]
     H = ["<table style='border-collapse:collapse;font-size:13px'>",
          "<tr><td></td><td><b>barcode</b></td>" + "".join(f"<td style='padding:0 8px'><b>pos {i}</b></td>" for i in range(npos)) + "</tr>",
          "<tr><td style='padding-right:8px'><b>Letter (mixture)</b></td><td></td>" +
          "".join("<td style='padding:2px 8px;border-left:1px solid #ccc'>" + "<br>".join(chip(t) for t in C.letter_trimers(int(v))) + "</td>" for v in lt) + "</tr>"]
     for k, r in enumerate(mol):
-        s = r.tobytes().decode()
-        H.append(f"<tr><td style='padding-right:8px'>molecule {k}</td><td><code>{s[:12]}</code></td>" +
-                 "".join(f"<td style='padding:2px 8px;border-left:1px solid #ccc'>{chip(s[12 + 3 * i:15 + 3 * i])}</td>" for i in range(npos)) + "</tr>")
+        x = r.tobytes().decode()
+        H.append(f"<tr><td style='padding-right:8px'>molecule {k}</td><td><code>{x[:12]}</code></td>" +
+                 "".join(f"<td style='padding:2px 8px;border-left:1px solid #ccc'>{chip(x[12 + 3 * i:15 + 3 * i])}</td>" for i in range(npos)) + "</tr>")
     st.markdown("".join(H) + "</table>", unsafe_allow_html=True)
-    st.caption("Each molecule picks one trimer out of the letter's 5 at every position. Red = a trimer that is not in Omega (substitution error).")
 
-    st.subheader("Download the encoded file")
-    meta_fq = (name, len(data), sha[:16])
-    d1, d2, d3 = st.columns(3)
-    if reads is not None:
-        mb = n_reads * (2 * C.READ_LEN + 90) / 1e6
-        d1.download_button(f"FASTQ ({mb:,.0f} MB)", lambda: C.to_fastq(reads, copies, *meta_fq), file_name="encoded.fastq",
-                           mime="text/plain", on_click="ignore", help="Molecules with metadata in the header lines. Edit it, then decode it in tab 2.")
-        d2.download_button("CSV: molecules", lambda: C.to_molecule_csv(reads, copies), file_name="molecules.csv",
-                           mime="text/csv", on_click="ignore", help="One row per molecule, trimers separated by spaces.")
-    if n_letters <= 300_000:
-        d3.download_button("CSV: encoding table", lambda: C.to_letter_csv(letters), file_name="encoding_table.csv",
-                           mime="text/csv", on_click="ignore", help="bits → letter → 5 trimers for every position")
-    else:
-        d3.caption("Encoding table CSV is offered for files up to about 450 KB.")
 
-# ================================================================== DECODE
-with tab_dec:
-    src = st.radio("Molecules to decode", ["The molecules just made in tab 1", "Upload a FASTQ file (e.g. the downloaded one, after editing)"])
-    correct = st.checkbox("Error-correcting decoder", True,
-                          help="ON: barcode repaired, reads with a trimer outside Omega are ignored, the 5 most frequent trimers form the letter. "
-                               "OFF: any unexpected trimer makes the letter unreadable.")
-    reads_in, meta, dropped = None, {}, 0
-    enc = st.session_state.get("enc")
-    if src.startswith("The"):
-        if enc is None:
-            st.info("Encode a file in tab 1 first (with a molecule count within the limit).")
-        else:
-            reads_in = enc["reads"]
-            meta = dict(name=enc["name"], bytes=len(enc["data"]), sha=enc["sha"][:16])
-    else:
-        fq = st.file_uploader("FASTQ (.fastq or .fastq.gz)", key="fq")
-        if fq is not None:
-            reads_in, meta, dropped = C.parse_fastq(fq.getvalue())
-            if len(reads_in) == 0:
-                st.error("No reads of the expected length (372 nt) found."); reads_in = None
-    if reads_in is not None and st.button("Decode", type="primary"):
-        with st.spinner("Decoding..."):
-            let, stt = C.decode_reads(reads_in, meta.get("bytes"), correct)
-            out = C.letters_to_bytes(let, meta["bytes"]) if meta.get("bytes") else C.letters_to_bytes(let, len(let) * C.BITS // 8)
-        st.session_state["dec"] = dict(out=out, stt=stt, meta=meta, dropped=dropped, correct=correct)
-    dec = st.session_state.get("dec")
-    if dec:
-        stt, meta, out = dec["stt"], dec["meta"], dec["out"]
-        st.subheader("Result")
-        same = bool(meta.get("sha")) and hashlib.sha256(out).hexdigest()[:16] == meta["sha"]
-        (st.success if same else st.error)("Decoded file is IDENTICAL to the original (SHA-256 matches)." if same else
-                                          "Decoded file differs from the original (or no checksum in the FASTQ header).")
-        a, b, c, d = st.columns(4)
-        a.metric("Molecules read", f"{stt['reads_in']:,}", f"-{dec['dropped']:,} wrong length" if dec["dropped"] else None, delta_color="off")
-        b.metric("Reads dropped (barcode)", f"{stt['bad_barcode']:,}", help="Barcode unreadable / not matching any strand")
-        c.metric("Trimer reads ignored (not in Omega)", f"{stt['ignored_trimers']:,}" if dec["correct"] else "n/a")
-        d.metric("Unreadable letters", f"{stt['unreadable_letters']:,} / {stt['letters']:,}")
-        st.caption(f"Barcodes repaired: {stt['repaired_barcodes']:,} · strands with no molecule: {stt['strands_missing']:,} · "
-                   f"unreadable letters are written as zeros.")
-        oname = meta.get("name", "decoded.bin")
-        p1, p2 = st.columns(2)
-        if enc and meta.get("sha") == enc["sha"][:16]:
-            with p1:
-                st.subheader("Original"); preview(enc["data"], enc["name"])
-        with p2 if enc and meta.get("sha") == enc["sha"][:16] else p1:
-            st.subheader("Decoded"); preview(out, oname)
-        st.markdown("**Decoded file metadata**"); meta_table(oname, out)
-        st.download_button("Download decoded file", out, file_name="decoded_" + oname, on_click="ignore")
+def step(n, title):
+    st.markdown(f"## Step {n} · {title}")
+
+
+
+# ------------------------------------------------------------------ page
+st.title("Combinatorial Shortmer DNA Storage")
+st.image(helix_svg(), width='stretch')
+st.image(pipeline_svg(), width='stretch')
+
+# ---------------------------------------------------------------- 1 upload
+step(1, "Upload your file")
+up = st.file_uploader("Any file: image, audio, video, text, ...", label_visibility="collapsed")
+if up is None:
+    orig, oname = b"DNA storage with combinatorial shortmers.", "sample.txt"
+    st.caption("No file uploaded: a short sample text is used.")
+else:
+    orig, oname = up.getvalue(), up.name
+if not orig:
+    st.warning("The file is empty."); st.stop()
+c1, c2 = st.columns(2)
+with c1: preview(orig, oname)
+with c2: meta_table(oname, orig)
+
+# ---------------------------------------------------------------- 2 compress
+step(2, "Compress the file (optional)")
+is_img = (mimetypes.guess_type(oname)[0] or "").startswith("image")
+modes = ["No compression", "Lossless compression (LZMA) - any file, exact recovery"]
+if is_img:
+    modes.append("Shrink the image (lossy JPEG) - smaller picture, much fewer DNA strands")
+mode = st.radio("Compression", modes, label_visibility="collapsed")
+payload, pname, comp = orig, oname, "none"
+if mode.startswith("Lossless"):
+    payload, comp = lzma.compress(orig, preset=9 | lzma.PRESET_EXTREME), "lzma"
+elif mode.startswith("Shrink"):
+    q1, q2 = st.columns(2)
+    side = q1.slider("Longest side (pixels)", 64, 3000, 640)
+    qual = q2.slider("JPEG quality", 5, 95, 40)
+    try:
+        payload = shrink_image(orig, side, qual)
+        pname = oname.rsplit(".", 1)[0] + "_small.jpg"
+    except Exception:
+        st.error("This image could not be opened for shrinking."); payload = orig
+psha = sha16(payload)
+k1, k2, k3 = st.columns(3)
+k1.metric("Original", f"{len(orig):,} bytes")
+k2.metric("To be stored in DNA", f"{len(payload):,} bytes", f"{(len(payload) / len(orig) - 1):+.0%}" if len(payload) != len(orig) else None, delta_color="off")
+k3.metric("Bits", f"{len(payload) * 8:,}")
+if mode.startswith("Shrink"):
+    preview(payload, pname)
+b1, b2 = st.columns(2)
+b1.download_button("Download binary (.bin)", payload, file_name=pname + ".bin", on_click="ignore", help="The bytes that will be written into DNA.")
+if len(payload) <= 3_000_000:
+    b2.download_button("Download bits (0/1 text)", lambda: "".join(map(str, np.unpackbits(np.frombuffer(payload, np.uint8)))).encode(),
+                       file_name=pname + "_bits.txt", on_click="ignore")
+
+letters = C.bytes_to_letters(payload)
+n_letters, n_strands = len(letters), len(letters) // C.LPS
+m1, m2, m3 = st.columns(3)
+m1.metric("Letters (12 bits each)", f"{n_letters:,}"); m2.metric("Strands (120 letters)", f"{n_strands:,}")
+m3.metric("Bits per nucleotide", f"{C.BITS / 3:.0f}", help="Standard DNA: 2")
+
+with st.expander("The encoding, letter by letter (first letters of the file)", expanded=True):
+    bits = np.unpackbits(np.frombuffer(payload[:10], dtype=np.uint8))
+    rows = [{"Position": i, "12 bits": "".join(map(str, np.pad(bits, (0, 96))[12 * i:12 * i + 12])), "Letter number": int(letters[i]),
+             "Letter = 5 trimers": " ".join(C.letter_trimers(int(letters[i]))),
+             "As Omega indices": " ".join(f"X{j + 1}" for j in C.SUBSETS[letters[i]])} for i in range(6)]
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch')
+    st.markdown("Omega (paper Table 1): " + " ".join(f"<small>X{i + 1}</small>{chip(t)}" for i, t in enumerate(C.OMEGA)), unsafe_allow_html=True)
+
+# ---------------------------------------------------------------- 3 synthesis
+step(3, "Synthesis: make the molecules")
+s1, s2 = st.columns(2)
+copies = s1.slider("Copies (molecules) per strand", 1, 300, 80,
+                   help="Each letter is a mixture of 5 trimers, but each molecule carries only ONE of them at every position, so many copies are needed to see all 5.")
+seed = s2.number_input("Random seed", 0, 10_000, 1,
+                       help="The molecules pick their trimers at random. The seed fixes that randomness: the same seed gives exactly the same molecules and errors every time; a different seed gives a different random outcome.")
+n_reads = n_strands * copies
+miss = C.miss_probability(copies)
+st.caption(f"**{n_reads:,}** molecules. A letter misses at least one of its 5 trimers with probability **{miss:.2%}** → about "
+           f"**{miss * n_letters:,.0f}** of {n_letters:,} letters unreadable even with no errors (≈ 11.4 copies needed on average).")
+if n_reads > MAX_READS:
+    st.error(f"{n_reads:,} molecules is more than this app can handle ({MAX_READS:,}). With {copies} copies the file to store must be at most "
+             f"**{MAX_READS // copies * C.LPS * 12 // 8:,} bytes**. Use Step 2 (compression / shrink image) or fewer copies.")
+    st.stop()
+clean = get_clean(psha, letters, copies, int(seed))
+v1, v2, v3 = st.columns(3)
+sidx = v1.number_input("Strand number", 0, n_strands - 1, 0)
+npos = v2.slider("Positions to show", 3, 16, 8)
+nmol = v3.slider("Molecules to show", 1, 15, min(8, copies))
+st.markdown("**Top row:** the letter at each position = its 5 trimers (the mixture that is synthesized). "
+            "**Rows below:** real molecules; each one holds a single trimer of the 5 at every position.")
+viewer(clean, letters, copies, sidx, npos, nmol)
+
+# ---------------------------------------------------------------- 4 errors
+step(4, "Introduce substitution errors")
+p_sub = st.slider("Substitution error per nucleotide (%)", 0.0, 5.0, 0.5, 0.1,
+                  help="Each base of each molecule is replaced by a different base with this probability.") / 100
+reads, n_changed = get_noisy(psha, copies, int(seed), p_sub, clean)
+st.caption(f"**{n_changed:,}** of {reads.size:,} bases changed. Red chips = the trimer is no longer in Omega.")
+if p_sub > 0:
+    viewer(reads, letters, copies, sidx, npos, nmol)
+meta = dict(name=pname if comp == "none" else oname, bytes=len(payload), sha=psha, comp=comp)
+if comp == "lzma":
+    meta["orig"] = sha16(orig)
+d1, d2, d3 = st.columns(3)
+mb = len(reads) * (2 * C.READ_LEN + 120) / 1e6
+d1.download_button(f"Download FASTQ ({mb:,.0f} MB)", lambda: C.to_fastq(reads, copies, meta), file_name="encoded.fastq",
+                   mime="text/plain", on_click="ignore", help="The molecules (with these errors). Edit it by hand if you like, then upload it in Step 5.")
+d2.download_button("Download CSV: molecules", lambda: C.to_molecule_csv(reads, copies), file_name="molecules.csv",
+                   mime="text/csv", on_click="ignore", help="One row per molecule, trimers separated by spaces.")
+if n_letters <= 300_000:
+    d3.download_button("Download CSV: encoding table", lambda: C.to_letter_csv(letters), file_name="encoding_table.csv",
+                       mime="text/csv", on_click="ignore")
+
+# ---------------------------------------------------------------- 5 decode
+step(5, "Decode")
+src = st.radio("Molecules to decode", ["Use the molecules from Step 4 (no upload needed)", "Upload a FASTQ file (for example the downloaded one, edited by hand)"])
+correct = st.checkbox("Error-correcting decoder", True,
+                      help="ON: barcode repaired, reads with a trimer outside Omega are ignored, the 5 most frequent trimers form the letter. "
+                           "OFF: any unexpected trimer makes the letter unreadable.")
+reads_in, dmeta, dropped = None, {}, 0
+if src.startswith("Use"):
+    reads_in, dmeta = reads, meta
+else:
+    fq = st.file_uploader("FASTQ (.fastq or .fastq.gz)", key="fq")
+    if fq is not None:
+        reads_in, dmeta, dropped = C.parse_fastq(fq.getvalue())
+        if len(reads_in) == 0:
+            st.error("No reads of the expected length (372 nt) found."); reads_in = None
+key = (psha, copies, int(seed), p_sub, correct, src[:3], getattr(fq, "file_id", None) if not src.startswith("Use") else None)
+if reads_in is not None and st.button("Decode", type="primary"):
+    with st.spinner("Decoding..."):
+        let, stt = C.decode_reads(reads_in, dmeta.get("bytes"), correct)
+        nb = dmeta.get("bytes") or len(let) * C.BITS // 8
+        st.session_state["dec"] = dict(out=C.letters_to_bytes(let, nb), stt=stt, meta=dmeta, dropped=dropped, correct=correct, key=key)
+dec = st.session_state.get("dec")
+if dec and dec["key"] == key:
+    stt, dm, out = dec["stt"], dec["meta"], dec["out"]
+    same = bool(dm.get("sha")) and sha16(out) == dm["sha"]
+    (st.success if same else st.error)("Recovered bytes are IDENTICAL to what was written (SHA-256 matches)." if same else
+                                      "Recovered bytes differ from what was written (or the FASTQ header has no checksum).")
+    a, b, c, d = st.columns(4)
+    a.metric("Molecules read", f"{stt['reads_in']:,}", f"-{dec['dropped']:,} wrong length" if dec["dropped"] else None, delta_color="off")
+    b.metric("Reads dropped (bad barcode)", f"{stt['bad_barcode']:,}")
+    c.metric("Trimer reads ignored (not in Omega)", f"{stt['ignored_trimers']:,}" if dec["correct"] else "n/a")
+    d.metric("Unreadable letters", f"{stt['unreadable_letters']:,} / {stt['letters']:,}")
+    st.caption(f"Strands with no molecule: {stt['strands_missing']:,} · unreadable letters are written as zeros.")
+
+    # ------------------------------------------------------------ 6 decompress + preview
+    step(6, "Decompress and compare")
+    final, fname = out, dm.get("name", "decoded.bin")
+    if dm.get("comp") == "lzma":
+        try:
+            final = lzma.decompress(out)
+            st.success(f"Decompressed: {len(out):,} → {len(final):,} bytes" +
+                       (" (matches the original checksum)" if dm.get("orig") == sha16(final) else " (checksum does NOT match the original)"))
+        except Exception:
+            st.error("The compressed data is damaged and cannot be decompressed (too many unreadable letters). Showing the raw bytes instead.")
+            fname = fname + ".lzma"
+    p1, p2 = st.columns(2)
+    with p1:
+        st.subheader("Original"); preview(orig, oname); meta_table(oname, orig)
+    with p2:
+        st.subheader("Recovered"); preview(final, fname); meta_table(fname, final)
+    st.download_button("Download recovered file", final, file_name="recovered_" + fname, on_click="ignore")
+    if dm.get("comp") == "none" and mode.startswith("Shrink") and src.startswith("Use"):
+        st.caption("The recovered file is the shrunk picture from Step 2 (lossy shrinking cannot be undone), so it looks smaller than the original.")

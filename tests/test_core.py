@@ -29,8 +29,8 @@ def test_correction_recovers_substitutions():
 def test_fastq_roundtrip():
     d = os.urandom(3000); L = C.bytes_to_letters(d)
     reads, _ = C.make_reads(L, 120, 0.0)
-    fq = C.to_fastq(reads, 120, "a b.jpg", len(d), "abc123")
+    fq = C.to_fastq(reads, 120, dict(name="a b.jpg", bytes=len(d), sha="abc123", comp="lzma"))
     r2, meta, bad = C.parse_fastq(fq)
-    assert meta["name"] == "a b.jpg" and bad == 0 and (r2 == reads).all()
+    assert meta["name"] == "a b.jpg" and meta["comp"] == "lzma" and bad == 0 and (r2 == reads).all()
     out, _ = C.decode_reads(r2, meta["bytes"], True)
     assert C.letters_to_bytes(out, len(d)) == d
