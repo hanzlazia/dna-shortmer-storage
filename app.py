@@ -5,7 +5,7 @@ import mimetypes
 import numpy as np
 import pandas as pd
 import streamlit as st
-import codec as C
+import dna_codec as C
 
 st.set_page_config(page_title="Shortmer DNA Storage", layout="wide")
 MAX_READS = 200_000          # molecules kept in memory / in one FASTQ download

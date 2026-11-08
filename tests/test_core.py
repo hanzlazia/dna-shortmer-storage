@@ -1,7 +1,7 @@
 import os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import numpy as np
-import codec as C
+import dna_codec as C
 
 def test_omega_distance_2():
     assert min(sum(a != b for a, b in zip(x, y)) for i, x in enumerate(C.OMEGA) for y in C.OMEGA[i + 1:]) == 2
