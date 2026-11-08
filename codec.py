@@ -43,33 +43,169 @@ def letter_trimers(letter: int) -> list[str]:
     return [OMEGA[j] for j in SUBSETS[letter]]
 
 
-def simulate(letters: np.ndarray, reads: int, p_err: float, seed: int = 1, chunk: int = 400_000):
-    """Read the combinatorial letters back, with and without substitution errors.
 
-    Every letter is a mixture of its 5 trimers. A read of one position returns one trimer chosen
-    at random (coupon collector, paper Sec. 2.3). With probability p_err a read has ONE wrong base;
-    because d = 2 this never produces another member of Omega (paper: it is detected).
-    Returns decoded letter arrays for three decoders (unreadable letters -> 0):
-      clean   : no errors, just the random sampling of `reads` reads per letter
-      plain   : with errors, decoder accepts the raw set of trimers it sees
-      checked : with errors, decoder first throws away reads that are not in Omega (d = 2 check)
-    """
+# ----------------------------------------------------------------------------- molecules / FASTQ
+LPS = LETTERS_PER_STRAND
+READ_LEN = BARCODE_LEN + 3 * LPS
+ASCII = np.frombuffer(b"ACGT", dtype=np.uint8)
+TRI_BASES = np.array([["ACGT".index(c) for c in t] for t in OMEGA], dtype=np.uint8)   # (16, 3)
+
+
+def n_strands_for(n_bytes: int) -> int:
+    return -(-n_bytes * 8 // (BITS * LPS))
+
+
+def miss_probability(copies: int) -> float:
+    """P(at least one of the 5 trimers of a letter is never seen in `copies` molecules) - coupon collector."""
+    from math import comb
+    return float(sum((-1) ** (j + 1) * comb(K, j) * (1 - j / K) ** copies for j in range(1, K + 1)))
+
+
+def make_reads(letters: np.ndarray, copies: int, p_sub: float, seed: int = 1):
+    """Synthesize `copies` molecules per strand: every molecule takes ONE random trimer of the letter's 5 at each
+    position. Then each nucleotide is substituted by a different base with probability p_sub.
+    Returns (reads as ASCII matrix [n_strands*copies, READ_LEN], strand id of every read)."""
     rng = np.random.default_rng(seed)
-    out = {k: np.zeros_like(letters) for k in ("clean", "plain", "checked")}
-    for s in range(0, len(letters), chunk):
-        L = letters[s:s + chunk]
-        counts = rng.multinomial(reads, [1 / K] * K, size=len(L))     # reads of each of the 5 trimers
-        bad = rng.binomial(counts, p_err)                              # of those, reads with 1 wrong base
-        all_seen = (counts > 0).all(axis=1)
-        no_err = bad.sum(axis=1) == 0
-        clean_seen = ((counts - bad) > 0).all(axis=1)
-        out["clean"][s:s + chunk] = np.where(all_seen, L, 0)
-        out["plain"][s:s + chunk] = np.where(all_seen & no_err, L, 0)
-        out["checked"][s:s + chunk] = np.where(clean_seen, L, 0)
-    return out
+    n = len(letters) // LPS
+    sub = SUBSETS[letters.reshape(n, LPS)]                                        # (n, 120, 5)
+    pick = rng.integers(0, K, size=(n, copies, LPS, 1))
+    tri = np.take_along_axis(np.broadcast_to(sub[:, None], (n, copies, LPS, K)), pick, axis=3)[..., 0]
+    pay = TRI_BASES[tri].reshape(n, copies, 3 * LPS)
+    ids = np.arange(n)[:, None]
+    bc = ((ids >> (2 * np.arange(BARCODE_LEN - 1, -1, -1))) & 3).astype(np.uint8)  # (n, 12)
+    seq = np.concatenate([np.broadcast_to(bc[:, None, :], (n, copies, BARCODE_LEN)), pay], axis=2)
+    seq = np.ascontiguousarray(seq.reshape(n * copies, READ_LEN), dtype=np.uint8)
+    flat = seq.reshape(-1)
+    n_err = rng.binomial(flat.size, p_sub)
+    if n_err:
+        pos = rng.integers(0, flat.size, n_err)
+        flat[pos] = (flat[pos] + rng.integers(1, 4, n_err)) % 4                    # substitution only
+    return ASCII[seq], np.repeat(np.arange(n), copies)
 
 
-def example_molecules(letter_row: np.ndarray, n: int = 6, seed: int = 3) -> list[str]:
-    """A few of the physical molecules of one strand: each picks one trimer per letter at random."""
-    rng = np.random.default_rng(seed)
-    return ["".join(OMEGA[SUBSETS[l][rng.integers(K)]] for l in letter_row) for _ in range(n)]
+def spaced(reads: np.ndarray) -> np.ndarray:
+    """barcode + space + trimers separated by spaces (for reading by eye / CSV)."""
+    m = len(reads)
+    bc = reads[:, :BARCODE_LEN]
+    tri = np.concatenate([reads[:, BARCODE_LEN:].reshape(m, LPS, 3), np.full((m, LPS, 1), 32, np.uint8)], axis=2)
+    return np.concatenate([bc, np.full((m, 1), 32, np.uint8), tri.reshape(m, 4 * LPS)[:, :-1]], axis=1)
+
+
+def to_fastq(reads: np.ndarray, copies: int, name: str, n_bytes: int, sha16: str) -> bytes:
+    from urllib.parse import quote
+    meta = f" name={quote(name)} bytes={n_bytes} sha={sha16}".encode()
+    qual = b"I" * READ_LEN
+    return b"".join(b"@S%06d_C%03d%s\n%s\n+\n%s\n" % (k // copies, k % copies, meta, reads[k].tobytes(), qual)
+                    for k in range(len(reads)))
+
+
+def to_molecule_csv(reads: np.ndarray, copies: int) -> bytes:
+    sp = spaced(reads)
+    return b"strand,copy,barcode_and_trimers,sequence\n" + b"".join(
+        b"%d,%d,%s,%s\n" % (k // copies, k % copies, sp[k].tobytes(), reads[k].tobytes()) for k in range(len(reads)))
+
+
+def to_letter_csv(letters: np.ndarray) -> bytes:
+    rows = ["strand,position,bits_12,letter_number,trimers,omega_indices"]
+    for i, v in enumerate(letters.tolist()):
+        rows.append(f"{i // LPS},{i % LPS},{v:012b},{v},{' '.join(letter_trimers(v))},"
+                    f"{' '.join('X%d' % (j + 1) for j in SUBSETS[v])}")
+    return "\n".join(rows).encode()
+
+
+def parse_fastq(raw: bytes):
+    """-> (reads ASCII matrix, metadata dict, number of reads discarded because their length is wrong)."""
+    import gzip, re
+    from urllib.parse import unquote
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    lines = raw.replace(b"\r", b"").split(b"\n")
+    seqs = [x.strip().upper() for x in lines[1::4]]
+    good = [x for x in seqs if len(x) == READ_LEN]
+    mt = re.search(rb"name=(\S+) bytes=(\d+) sha=(\w+)", lines[0]) if lines else None
+    meta = {"name": unquote(mt.group(1).decode()), "bytes": int(mt.group(2)), "sha": mt.group(3).decode()} if mt else {}
+    reads = np.frombuffer(b"".join(good), dtype=np.uint8).reshape(-1, READ_LEN) if good else np.zeros((0, READ_LEN), np.uint8)
+    return reads, meta, len(seqs) - len(good)
+
+
+# ----------------------------------------------------------------------------- decoder
+_EXACT = np.full(65, -1, np.int16)      # trimer code (base-4, 64 = unreadable) -> index in Omega, exact match only
+for _c in range(64):
+    _t = "".join("ACGT"[(_c >> sh) & 3] for sh in (4, 2, 0))
+    if _t in OMEGA:
+        _EXACT[_c] = OMEGA.index(_t)
+_LUT = np.full(256, 4, np.uint8)
+for _i, _ch in enumerate(b"ACGT"):
+    _LUT[_ch] = _i
+
+
+def decode_reads(reads: np.ndarray, n_bytes: int | None, correct: bool, chunk: int = 1500):
+    """Group molecules by barcode, vote the trimers seen at each position, rebuild the letters.
+    correct=False: a position is valid only if exactly 5 Omega trimers were seen and nothing else.
+    correct=True : barcode repaired (1 substitution); reads whose trimer is not in Omega are ignored (d = 2 lets a
+                   single substitution always be detected); the 5 most-voted trimers are the letter."""
+    m = len(reads)
+    v = _LUT[reads]
+    bc_ok = (v[:, :BARCODE_LEN] < 4).all(axis=1)
+    bc = (v[:, :BARCODE_LEN].astype(np.int64) << (2 * np.arange(BARCODE_LEN - 1, -1, -1))).sum(axis=1)
+    bc[~bc_ok] = -1
+    st = {"reads_in": m, "bad_barcode": 0, "repaired_barcodes": 0, "ignored_trimers": 0}
+
+    uniq, cnt = np.unique(bc[bc >= 0], return_counts=True)
+    if len(cnt) == 0:
+        raise ValueError("No readable molecules.")
+    major = uniq[cnt >= max(2, 0.5 * np.median(cnt))] if correct else uniq
+    if n_bytes is not None:
+        n_strands = n_strands_for(n_bytes)
+    else:
+        n_strands = int((major if len(major) else uniq).max()) + 1
+    if correct:
+        minor = np.setdiff1d(uniq, major)
+        if len(minor):
+            digs = np.arange(BARCODE_LEN)
+            cand = (minor[:, None, None] ^ (np.arange(1, 4)[None, :, None] << (2 * digs)[None, None, :])).reshape(len(minor), -1)
+            hit = np.isin(cand, major)
+            ok = hit.sum(axis=1) == 1
+            fix = np.where(ok, cand[np.arange(len(minor)), hit.argmax(axis=1)], -1)
+            pos = np.searchsorted(minor, bc)
+            pos[pos >= len(minor)] = 0
+            is_min = (bc >= 0) & (minor[pos] == bc)
+            newbc = np.where(is_min, fix[pos], bc)
+            st["repaired_barcodes"] = int((is_min & (newbc >= 0)).sum())
+            bc = newbc
+    keep = (bc >= 0) & (bc < n_strands)
+    st["bad_barcode"] = int(m - keep.sum())
+
+    t = v[keep][:, BARCODE_LEN:].reshape(-1, LPS, 3).astype(np.int16)
+    code = np.where((t > 3).any(axis=2), 64, t[..., 0] * 16 + t[..., 1] * 4 + t[..., 2])
+    s = bc[keep]
+    order = np.argsort(s, kind="stable")
+    s, code = s[order], code[order]
+    exact = _EXACT[code]
+    vote = exact
+    st["ignored_trimers"] = int((exact < 0).sum())
+
+    letters = np.zeros(n_strands * LPS, np.int32)
+    failed = np.ones(n_strands * LPS, bool)
+    posn = np.arange(LPS)[None, :]
+    for a in range(0, n_strands, chunk):
+        nb = min(chunk, n_strands - a)
+        lo, hi = np.searchsorted(s, a), np.searchsorted(s, a + nb)
+        base = (s[lo:hi, None] - a) * LPS + posn
+        vv = vote[lo:hi].astype(np.int64)
+        good = vv >= 0
+        votes = np.bincount((base * 16 + vv)[good], minlength=nb * LPS * 16).reshape(nb, LPS, 16)
+        bad = np.bincount(base[~good], minlength=nb * LPS).reshape(nb, LPS)
+        npres = (votes > 0).sum(axis=2)
+        top5 = np.argsort(-votes, axis=2, kind="stable")[..., :K]
+        mask = (1 << top5).sum(axis=2)
+        ok = (npres >= K) if correct else ((npres == K) & (bad == 0))
+        let = MASK_TO_LETTER[mask]
+        ok &= let >= 0
+        letters[a * LPS:(a + nb) * LPS] = np.where(ok, let, 0).ravel()
+        failed[a * LPS:(a + nb) * LPS] = (~ok).ravel()
+    st["unreadable_letters"] = int(failed.sum())
+    st["letters"] = len(letters)
+    st["strands"] = n_strands
+    st["strands_missing"] = int(n_strands - len(np.unique(s)))
+    return letters, st
