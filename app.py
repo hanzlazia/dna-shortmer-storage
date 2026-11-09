@@ -50,8 +50,25 @@ def pipeline_svg() -> str:
     return "".join(out) + "</svg>"
 
 
+def sniff(data: bytes, name: str) -> str:
+    """File type from the content (so a renamed or .bin file still previews); falls back to the file name."""
+    h = data[:16]
+    if h[:3] == b"ID3" or (len(h) > 1 and h[0] == 0xFF and h[1] & 0xE0 == 0xE0): return "audio/mpeg"
+    if h[:4] == b"RIFF" and h[8:12] == b"WAVE": return "audio/wav"
+    if h[:4] == b"OggS": return "audio/ogg"
+    if h[:4] == b"fLaC": return "audio/flac"
+    if h[:3] == b"\xff\xd8\xff": return "image/jpeg"
+    if h[:8] == b"\x89PNG\r\n\x1a\n": return "image/png"
+    if h[:3] == b"GIF": return "image/gif"
+    if h[:4] == b"RIFF" and h[8:12] == b"WEBP": return "image/webp"
+    if h[4:8] == b"ftyp": return "audio/mp4" if h[8:12] in (b"M4A ", b"M4B ") else "video/mp4"
+    if h[:4] == b"\x1aE\xdf\xa3": return "video/webm"
+    if h[:4] == b"%PDF": return "application/pdf"
+    return mimetypes.guess_type(name)[0] or ""
+
+
 def preview(data: bytes, name: str):
-    mt = mimetypes.guess_type(name)[0] or ""
+    mt = sniff(data, name)
     kind = mt.split("/")[0]
     try:
         if kind == "image":
@@ -70,7 +87,7 @@ def preview(data: bytes, name: str):
 
 def meta_table(name: str, data: bytes):
     st.dataframe(pd.DataFrame({"Field": ["Name", "Type", "Size", "SHA-256 (first 16)"],
-                               "Value": [name, mimetypes.guess_type(name)[0] or "unknown", f"{len(data):,} bytes",
+                               "Value": [name, sniff(data, name) or "unknown", f"{len(data):,} bytes",
                                          hashlib.sha256(data).hexdigest()[:16]]}), hide_index=True, width='stretch')
 
 
@@ -119,10 +136,10 @@ def shrink_av(data: bytes, name: str, kind: str, a: int, b: int) -> bytes:
 def safe_limit(cap: int):
     """Largest file (bytes) that this app can store AND read back exactly, and the copies needed for it."""
     best = (0, 0)
-    for c in range(20, 301):
-        strands = cap // c
-        if C.miss_probability(c) * strands * C.LPS < 0.1 and strands * 180 > best[0]:
-            best = (strands * 180, c)
+    for c in range(10, 301):
+        n_data = (cap // c) * C.RS_K // (C.RS_K + C.RS_P)
+        if C.expected_lost(c, n_data, True) < 0.1 and n_data * 180 > best[0]:
+            best = (n_data * 180, c)
     return best
 
 
@@ -170,11 +187,13 @@ with c2: meta_table(oname, orig)
 
 # ---------------------------------------------------------------- 2 compress
 step(2, "Compress the file (optional)")
-kind = (mimetypes.guess_type(oname)[0] or "").split("/")[0]
+kind = sniff(orig, oname).split("/")[0]
 modes = ["No compression", "Lossless compression (LZMA) - exact recovery. Does NOT help files that are already compressed (JPEG, MP3, MP4, ZIP)"]
 if kind in ("image", "audio", "video"):
     modes.append(f"Shrink the {kind} (lossy) - real size reduction, quality is reduced")
-mode = st.radio("Compression", modes, label_visibility="collapsed")
+too_big_file = len(orig) > safe_limit(MAX_READS)[0]
+mode = st.radio("Compression", modes, label_visibility="collapsed", index=len(modes) - 1 if (too_big_file and len(modes) == 3) else 0,
+                key=f"mode_{sha16(orig)}")
 payload, pname, comp = orig, oname, "none"
 if mode.startswith("Lossless"):
     payload, comp = lzma.compress(orig, preset=9 | lzma.PRESET_EXTREME), "lzma"
@@ -215,10 +234,11 @@ if len(payload) <= 3_000_000:
     b2.download_button("Download bits (0/1 text)", lambda: "".join(map(str, np.unpackbits(np.frombuffer(payload, np.uint8)))).encode(),
                        file_name=pname + "_bits.txt", on_click="ignore")
 
-letters = C.bytes_to_letters(payload)
-n_letters, n_strands = len(letters), len(letters) // C.LPS
+letters_data = C.bytes_to_letters(payload)
+letters = letters_data
+n_data = len(letters_data) // C.LPS
 m1, m2, m3 = st.columns(3)
-m1.metric("Letters (12 bits each)", f"{n_letters:,}"); m2.metric("Strands (120 letters)", f"{n_strands:,}")
+m1.metric("Letters (12 bits each)", f"{len(letters_data):,}"); m2.metric("Data strands (120 letters)", f"{n_data:,}")
 m3.metric("Bits per nucleotide", f"{C.BITS / 3:.0f}", help="Standard DNA: 2")
 
 with st.expander("The encoding, letter by letter (first letters of the file)", expanded=True):
@@ -231,23 +251,32 @@ with st.expander("The encoding, letter by letter (first letters of the file)", e
 
 # ---------------------------------------------------------------- 3 synthesis
 step(3, "Synthesis: make the molecules")
+rs_choice = st.radio("Error protection across strands", ["With Reed–Solomon (the paper's method)", "Without Reed–Solomon"],
+                     help="With: the paper adds 6 parity strands to every 42 data strands (over GF(2^12)). Any 6 letters unreadable at the same position "
+                          "are rebuilt, so far fewer copies are needed (about 14% more strands). Without: no parity strands, so every letter must be read "
+                          "directly and many more copies are needed.", horizontal=True)
+rs = rs_choice.startswith("With ")
 s1, s2 = st.columns(2)
-copies = s1.slider("Copies (molecules) per strand", 1, 300, 80,
-                   help="Each letter is a mixture of 5 trimers, but each molecule carries only ONE of them at every position, so many copies are needed to see all 5.")
+need = next((c for c in range(5, 301) if C.expected_lost(c, n_data, rs) < 0.05), 300)
+copies = s1.slider("Copies (molecules) per strand", 1, 300, need, key=f"copies_{psha}_{rs}",
+                   help="Each letter is a mixture of 5 trimers, but each molecule carries only ONE of them at every position, so several copies are needed to see all 5.")
 seed = s2.number_input("Random seed", 0, 10_000, 1,
                        help="The molecules pick their trimers at random. The seed fixes that randomness: the same seed gives exactly the same molecules and errors every time; a different seed gives a different random outcome.")
+letters = C.rs_encode(letters_data) if rs else letters_data
+n_letters, n_strands = len(letters), len(letters) // C.LPS
 n_reads = n_strands * copies
 miss = C.miss_probability(copies)
-st.caption(f"**{n_reads:,}** molecules. A letter misses at least one of its 5 trimers with probability **{miss:.2%}** → about "
-           f"**{miss * n_letters:,.0f}** of {n_letters:,} letters unreadable even with no errors (≈ 11.4 copies needed on average).")
-if miss * n_letters >= 0.5:
-    st.warning(f"With {copies} copies about {miss * n_letters:,.0f} letters will be unreadable, so the recovered file will be damaged "
-               f"(an audio/video/image may not play). Use more copies or a smaller file (Step 2).")
+lost = C.expected_lost(copies, n_data, rs)
+st.caption(f"**{n_strands:,}** strands ({n_data:,} data" + (f" + {n_strands - n_data:,} parity" if rs else "") + f") × {copies} copies = **{n_reads:,}** molecules.  "
+           f"A letter misses at least one of its 5 trimers with probability **{miss:.2%}** → about **{miss * n_letters:,.0f}** unreadable letters before repair."
+           + (f"  After Reed–Solomon repair, about **{lost:,.1f}** letter positions are expected to stay lost." if rs else ""))
+if lost >= 0.5:
+    st.warning(f"With {copies} copies about {lost:,.0f} letters will stay unreadable, so the recovered file will be damaged "
+               f"(an audio/video/image may not play). Use more copies" + ("" if rs else ", turn on Reed–Solomon") + " or a smaller file (Step 2).")
 if n_reads > MAX_READS:
-    st.error(f"{n_reads:,} molecules is more than this app can handle ({MAX_READS:,}). With {copies} copies the file to store must be at most "
-             f"**{MAX_READS // copies * C.LPS * 12 // 8:,} bytes**. Use Step 2 (shrink) or fewer copies (but then letters go unreadable).")
+    st.error(f"{n_reads:,} molecules is more than this app can handle ({MAX_READS:,}). Use Step 2 (shrink) or fewer copies.")
     st.stop()
-clean = get_clean(psha, letters, copies, int(seed))
+clean = get_clean(f"{psha}{int(rs)}", letters, copies, int(seed))
 v1, v2, v3 = st.columns(3)
 sidx = v1.number_input("Strand number", 0, n_strands - 1, 0)
 npos = v2.slider("Positions to show", 3, 16, 8)
@@ -258,13 +287,13 @@ viewer(clean, letters, copies, sidx, npos, nmol)
 
 # ---------------------------------------------------------------- 4 errors
 step(4, "Introduce substitution errors")
-p_sub = st.slider("Substitution error per nucleotide (%)", 0.0, 5.0, 0.5, 0.1,
+p_sub = st.slider("Substitution error per nucleotide (%)", 0.0, 5.0, 0.1, 0.01, format="%.2f",
                   help="Each base of each molecule is replaced by a different base with this probability.") / 100
-reads, n_changed = get_noisy(psha, copies, int(seed), p_sub, clean)
+reads, n_changed = get_noisy(f"{psha}{int(rs)}", copies, int(seed), p_sub, clean)
 st.caption(f"**{n_changed:,}** of {reads.size:,} bases changed. Red chips = the trimer is no longer in Omega.")
 if p_sub > 0:
     viewer(reads, letters, copies, sidx, npos, nmol)
-meta = dict(name=pname if comp == "none" else oname, bytes=len(payload), sha=psha, comp=comp)
+meta = dict(name=pname if comp == "none" else oname, bytes=len(payload), sha=psha, comp=comp, rs=int(rs))
 if comp == "lzma":
     meta["orig"] = sha16(orig)
 d1, d2, d3 = st.columns(3)
@@ -292,10 +321,10 @@ else:
         reads_in, dmeta, dropped = C.parse_fastq(fq.getvalue())
         if len(reads_in) == 0:
             st.error("No reads of the expected length (372 nt) found."); reads_in = None
-key = (psha, copies, int(seed), p_sub, correct, src[:3], getattr(fq, "file_id", None) if not src.startswith("Use") else None)
+key = (psha, rs, copies, int(seed), p_sub, correct, src[:3], getattr(fq, "file_id", None) if not src.startswith("Use") else None)
 if reads_in is not None and st.button("Decode", type="primary"):
     with st.spinner("Decoding..."):
-        let, stt = C.decode_reads(reads_in, dmeta.get("bytes"), correct)
+        let, stt = C.decode_reads(reads_in, dmeta.get("bytes"), correct, str(dmeta.get("rs", "0")) == "1")
         nb = dmeta.get("bytes") or len(let) * C.BITS // 8
         st.session_state["dec"] = dict(out=C.letters_to_bytes(let, nb), stt=stt, meta=dmeta, dropped=dropped, correct=correct, key=key)
 dec = st.session_state.get("dec")
@@ -308,7 +337,14 @@ if dec and dec["key"] == key:
     a.metric("Molecules read", f"{stt['reads_in']:,}", f"-{dec['dropped']:,} wrong length" if dec["dropped"] else None, delta_color="off")
     b.metric("Reads dropped (bad barcode)", f"{stt['bad_barcode']:,}")
     c.metric("Trimer reads ignored (not in Omega)", f"{stt['ignored_trimers']:,}" if dec["correct"] else "n/a")
-    d.metric("Unreadable letters", f"{stt['unreadable_letters']:,} / {stt['letters']:,}")
+    d.metric("Unreadable letters (before repair)", f"{stt['unreadable_letters']:,} / {stt['letters']:,}")
+    if str(dm.get("rs", "0")) == "1":
+        e1, e2 = st.columns(2)
+        e1.metric("Rebuilt by Reed–Solomon", f"{stt['rs_recovered']:,}")
+        e2.metric("Still unreadable (final)", f"{stt['still_unreadable']:,}")
+    if src.startswith("Use") and dec["correct"]:
+        st.caption(f"About **{C.miss_probability(copies) * stt['letters']:,.0f}** unreadable letters are expected from the number of copies alone "
+                   f"({copies} copies), independent of the error rate.")
     st.caption(f"Strands with no molecule: {stt['strands_missing']:,} · unreadable letters are written as zeros.")
 
     # ------------------------------------------------------------ 6 decompress + preview

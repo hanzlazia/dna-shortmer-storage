@@ -153,6 +153,104 @@ def parse_fastq(raw: bytes):
     return reads, meta, len(seqs) - len(good)
 
 
+
+# ----------------------------------------------------------------------------- Reed-Solomon across strands (paper step ii)
+# Groups of up to 42 data strands get 6 parity strands. Every column (letter position) is a codeword of a
+# systematic Cauchy Reed-Solomon code over GF(2^12): any 6 unreadable letters of the 48 can be rebuilt.
+RS_K, RS_P = 42, 6
+_EXP = [0] * 8190
+_LOG = [0] * 4096
+_x = 1
+for _i in range(4095):
+    _EXP[_i], _LOG[_x] = _x, _i
+    _x <<= 1
+    if _x & 0x1000:
+        _x ^= 0x1053                                  # x^12 + x^6 + x^4 + x + 1 (primitive)
+_EXP[4095:] = _EXP[:4095]
+_EXPA, _LOGA = np.array(_EXP, np.int32), np.array(_LOG, np.int32)
+
+
+def gf_mul(a, b):
+    a, b = np.asarray(a, np.int32), np.asarray(b, np.int32)
+    return np.where((a == 0) | (b == 0), 0, _EXPA[_LOGA[a] + _LOGA[b]])
+
+
+def _inv(a: int) -> int:
+    return _EXP[4095 - _LOG[a]]
+
+
+def _mul(a: int, b: int) -> int:
+    return 0 if a == 0 or b == 0 else _EXP[_LOG[a] + _LOG[b]]
+
+
+CAUCHY = np.array([[_inv(j ^ (RS_P + i)) for i in range(RS_K)] for j in range(RS_P)], np.int32)   # (6, 42)
+
+
+def group_sizes(n_data: int) -> list:
+    return [min(RS_K, n_data - s) for s in range(0, n_data, RS_K)]
+
+
+def total_strands(n_data: int, rs: bool) -> int:
+    return n_data + (RS_P * len(group_sizes(n_data)) if rs else 0)
+
+
+def rs_encode(letters: np.ndarray) -> np.ndarray:
+    """data letters (n_data*120) -> data and parity strands interleaved per group."""
+    D = np.asarray(letters, np.int32).reshape(-1, LPS)
+    out = []
+    for s in range(0, len(D), RS_K):
+        blk = D[s:s + RS_K]
+        par = np.bitwise_xor.reduce(gf_mul(CAUCHY[:, :len(blk), None], blk[None]), axis=1)
+        out += [blk, par]
+    return np.concatenate(out).reshape(-1)
+
+
+def rs_decode(letters: np.ndarray, failed: np.ndarray, n_data: int):
+    """Rebuild unreadable data letters from the readable ones. Returns (data letters, still-failed mask, number rebuilt)."""
+    L = np.asarray(letters, np.int32).reshape(-1, LPS).copy()
+    F = np.asarray(failed).reshape(-1, LPS).copy()
+    data, left, pos, before = [], [], 0, 0
+    for k in group_sizes(n_data):
+        blk, fm = L[pos:pos + k + RS_P], F[pos:pos + k + RS_P]
+        before += int(fm[:k].sum())
+        for p in np.flatnonzero(fm[:k].any(axis=0)):
+            er = np.flatnonzero(fm[:, p])
+            if len(er) > RS_P:
+                continue
+            U = [int(e) for e in er if e < k]
+            S = [j for j in range(RS_P) if (k + j) not in er][:len(U)]
+            known = [i for i in range(k) if i not in U]
+            rhs = blk[[k + j for j in S], p].copy()
+            if known:
+                rhs ^= np.bitwise_xor.reduce(gf_mul(CAUCHY[S][:, known], blk[known, p][None]), axis=1)
+            A = [[int(CAUCHY[j, u]) for u in U] + [int(r)] for j, r in zip(S, rhs)]
+            for c in range(len(U)):                       # Gauss-Jordan in GF(2^12)
+                piv = next(r for r in range(c, len(U)) if A[r][c])
+                A[c], A[piv] = A[piv], A[c]
+                iv = _inv(A[c][c]); A[c] = [_mul(iv, v) for v in A[c]]
+                for r in range(len(U)):
+                    if r != c and A[r][c]:
+                        f = A[r][c]; A[r] = [v ^ _mul(f, w) for v, w in zip(A[r], A[c])]
+            for c, u in enumerate(U):
+                blk[u, p], fm[u, p] = A[c][-1], False
+        data.append(blk[:k]); left.append(fm[:k]); pos += k + RS_P
+    after = np.concatenate(left).reshape(-1)
+    return np.concatenate(data).reshape(-1), after, before - int(after.sum())
+
+
+def expected_lost(copies: int, n_data: int, rs: bool) -> float:
+    """Expected number of unreadable letters (no RS) or unrecoverable letter positions (RS), from sampling alone."""
+    from math import comb
+    q = miss_probability(copies)
+    if not rs:
+        return q * n_data * LPS
+    tot = 0.0
+    for k in group_sizes(n_data):
+        n = k + RS_P
+        tot += LPS * (1 - sum(comb(n, x) * q ** x * (1 - q) ** (n - x) for x in range(RS_P + 1)))
+    return tot
+
+
 # ----------------------------------------------------------------------------- decoder
 _EXACT = np.full(65, -1, np.int16)      # trimer code (base-4, 64 = unreadable) -> index in Omega, exact match only
 for _c in range(64):
@@ -164,7 +262,7 @@ for _i, _ch in enumerate(b"ACGT"):
     _LUT[_ch] = _i
 
 
-def decode_reads(reads: np.ndarray, n_bytes: int | None, correct: bool, chunk: int = 1500):
+def decode_reads(reads: np.ndarray, n_bytes: int | None, correct: bool, rs: bool = False, chunk: int = 1500):
     """Group molecules by barcode, vote the trimers seen at each position, rebuild the letters.
     correct=False: a position is valid only if exactly 5 Omega trimers were seen and nothing else.
     correct=True : barcode parity checked (bad barcodes dropped); reads whose trimer is not in Omega are ignored (d = 2 lets a
@@ -178,8 +276,10 @@ def decode_reads(reads: np.ndarray, n_bytes: int | None, correct: bool, chunk: i
     bc = (dig[:, :-1] << (2 * np.arange(BARCODE_LEN - 2, -1, -1))).sum(axis=1)
     bc[~bc_ok] = -1
     st = {"reads_in": m, "bad_barcode": 0, "ignored_trimers": 0}
+    n_data = None
     if n_bytes is not None:
-        n_strands = n_strands_for(n_bytes)
+        n_data = n_strands_for(n_bytes)
+        n_strands = total_strands(n_data, rs)
     else:
         uniq, cnt = np.unique(bc[bc >= 0], return_counts=True)
         if len(cnt) == 0:
@@ -197,27 +297,55 @@ def decode_reads(reads: np.ndarray, n_bytes: int | None, correct: bool, chunk: i
     vote = exact
     st["ignored_trimers"] = int((exact < 0).sum())
 
-    letters = np.zeros(n_strands * LPS, np.int32)
-    failed = np.ones(n_strands * LPS, bool)
     posn = np.arange(LPS)[None, :]
-    for a in range(0, n_strands, chunk):
-        nb = min(chunk, n_strands - a)
-        lo, hi = np.searchsorted(s, a), np.searchsorted(s, a + nb)
-        base = (s[lo:hi, None] - a) * LPS + posn
-        vv = vote[lo:hi].astype(np.int64)
-        good = vv >= 0
-        votes = np.bincount((base * 16 + vv)[good], minlength=nb * LPS * 16).reshape(nb, LPS, 16)
-        bad = np.bincount(base[~good], minlength=nb * LPS).reshape(nb, LPS)
-        npres = (votes > 0).sum(axis=2)
-        top5 = np.argsort(-votes, axis=2, kind="stable")[..., :K]
-        mask = (1 << top5).sum(axis=2)
-        ok = (npres >= K) if correct else ((npres == K) & (bad == 0))
-        let = MASK_TO_LETTER[mask]
-        ok &= let >= 0
-        letters[a * LPS:(a + nb) * LPS] = np.where(ok, let, 0).ravel()
-        failed[a * LPS:(a + nb) * LPS] = (~ok).ravel()
+
+    def vote_pass(sel):
+        """Vote the trimers of the selected reads and build every letter (returns letters, failed, 16-bit trimer sets)."""
+        letters = np.zeros(n_strands * LPS, np.int32)
+        failed = np.ones(n_strands * LPS, bool)
+        sets = np.full(n_strands * LPS, 0xFFFF, np.int32)
+        ss, vv_all = s[sel], vote[sel]
+        for a in range(0, n_strands, chunk):
+            nb = min(chunk, n_strands - a)
+            lo, hi = np.searchsorted(ss, a), np.searchsorted(ss, a + nb)
+            base = (ss[lo:hi, None] - a) * LPS + posn
+            vv = vv_all[lo:hi].astype(np.int64)
+            good = vv >= 0
+            votes = np.bincount((base * 16 + vv)[good], minlength=nb * LPS * 16).reshape(nb, LPS, 16)
+            bad = np.bincount(base[~good], minlength=nb * LPS).reshape(nb, LPS)
+            npres = (votes > 0).sum(axis=2)
+            order = np.argsort(-votes, axis=2, kind="stable")
+            top5 = order[..., :K]
+            mask = (1 << top5).sum(axis=2)
+            ok = (npres >= K) if correct else ((npres == K) & (bad == 0))
+            if correct:        # 5th and 6th trimer equally supported -> cannot tell which is real: call it unreadable
+                v56 = np.take_along_axis(votes, order[..., K - 1:K + 1], axis=2)
+                ok &= ~((v56[..., 0] == v56[..., 1]) & (v56[..., 1] > 0))
+            let = MASK_TO_LETTER[mask]
+            ok &= let >= 0
+            letters[a * LPS:(a + nb) * LPS] = np.where(ok, let, 0).ravel()
+            failed[a * LPS:(a + nb) * LPS] = (~ok).ravel()
+            sets[a * LPS:(a + nb) * LPS] = np.where(ok, mask, 0xFFFF).ravel()
+        return letters, failed, sets
+
+    letters, failed, sets = vote_pass(np.ones(len(s), bool))
+    st["misplaced_reads"] = 0
+    if correct:
+        # A read that was filed under the wrong strand (barcode hit by 2 substitutions) disagrees with the consensus
+        # of that strand at most positions. Throw such reads away and vote again.
+        member = (sets.reshape(n_strands, LPS)[s] >> np.maximum(vote, 0)) & 1
+        seen = vote >= 0
+        agree = (member * seen).sum(axis=1) / np.maximum(seen.sum(axis=1), 1)
+        sel = agree >= 0.6
+        st["misplaced_reads"] = int((~sel).sum())
+        if st["misplaced_reads"]:
+            letters, failed, sets = vote_pass(sel)
     st["unreadable_letters"] = int(failed.sum())
     st["letters"] = len(letters)
     st["strands"] = n_strands
+    st["rs_recovered"] = 0
+    if rs and n_data is not None:
+        letters, failed, st["rs_recovered"] = rs_decode(letters, failed, n_data)
+    st["still_unreadable"] = int(failed.sum())
     st["strands_missing"] = int(n_strands - len(np.unique(s)))
     return letters, st

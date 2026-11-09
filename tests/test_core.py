@@ -32,5 +32,33 @@ def test_fastq_roundtrip():
     fq = C.to_fastq(reads, 120, dict(name="a b.jpg", bytes=len(d), sha="abc123", comp="lzma"))
     r2, meta, bad = C.parse_fastq(fq)
     assert meta["name"] == "a b.jpg" and meta["comp"] == "lzma" and bad == 0 and (r2 == reads).all()
-    out, _ = C.decode_reads(r2, meta["bytes"], True)
+    out, _ = C.decode_reads(r2, meta["bytes"], True, False)
     assert C.letters_to_bytes(out, len(d)) == d
+
+
+def test_gf_primitive():
+    assert len(set(C._EXP[:4095])) == 4095
+
+def test_rs_recovers_erasures():
+    rng = np.random.default_rng(0)
+    for n_data in (1, 5, 42, 100):
+        L = rng.integers(0, 4096, n_data * 120)
+        full = C.rs_encode(L)
+        assert len(full) == C.total_strands(n_data, True) * 120
+        failed = np.zeros(len(full), bool)
+        M = full.reshape(-1, 120).copy(); F = failed.reshape(-1, 120)
+        pos = 0
+        for k in C.group_sizes(n_data):                    # erase 6 random strands' letters in every column
+            for p in range(120):
+                for r in rng.choice(k + 6, size=min(6, k + 6), replace=False):
+                    F[pos + r, p] = True; M[pos + r, p] = 0
+            pos += k + 6
+        out, left, rec = C.rs_decode(M.reshape(-1), F.reshape(-1), n_data)
+        assert (out == L).all() and not left.any()
+
+def test_end_to_end_with_rs_few_copies():
+    d = os.urandom(90000); Ld = C.bytes_to_letters(d); L = C.rs_encode(Ld)
+    clean, _ = C.make_reads(L, 25, 0.0)
+    reads, _ = C.add_substitutions(clean, 0.001)
+    out, st = C.decode_reads(reads, len(d), True, True)
+    assert C.letters_to_bytes(out, len(d)) == d and st["unreadable_letters"] > 0 and st["still_unreadable"] == 0
