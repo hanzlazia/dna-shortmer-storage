@@ -165,32 +165,33 @@ def viewer(reads, letters, copies, sidx, npos, nmol):
 
 
 def diff_view(clean, noisy, copies, sidx, nmol):
-    """Molecules of one strand that were hit by errors: the original and the version after the errors, changed bases in red."""
+    """Molecules of one strand that were hit by errors: where it happened, the original and the changed piece."""
     c, n = clean[sidx * copies:(sidx + 1) * copies], noisy[sidx * copies:(sidx + 1) * copies]
     hit = np.flatnonzero((c != n).any(axis=1))
     if len(hit) == 0:
         st.info("No molecule of this strand was hit by an error. Try another strand number, or raise the error rate.")
         return
-    st.caption(f"{len(hit)} of {copies} molecules of strand {sidx} contain at least one error (showing {min(nmol, len(hit))}).")
-
-    def line(row_c, row_n, show_new):
-        out = []
-        for i in range(C.READ_LEN):
-            ch = (row_n if show_new else row_c)[i:i + 1].tobytes().decode()
-            if row_c[i] != row_n[i]:
-                ch = f"<span style='background:#f4b6b6;color:#a00;font-weight:700;border-radius:3px'>{ch}</span>"
-            out.append(ch)
-            if i == C.BARCODE_LEN - 1 or (i >= C.BARCODE_LEN and (i - C.BARCODE_LEN) % 3 == 2):
-                out.append(" ")
-        return "".join(out)
-
-    H = []
+    st.caption(f"{len(hit)} of {copies} molecules of strand {sidx} contain at least one error.")
+    red = "background:#f4b6b6;border-radius:4px;padding:1px 5px;font-family:monospace;font-size:13px"
+    rows = []
     for r in hit[:nmol]:
-        H.append(f"<div style='margin:6px 0 12px 0'><div style='font-size:12px;color:#556'>molecule {r}: "
-                 f"{int((c[r] != n[r]).sum())} base(s) changed</div>"
-                 f"<div style='font-family:monospace;font-size:12.5px;word-break:break-word'><b>before </b>{line(c[r], n[r], False)}</div>"
-                 f"<div style='font-family:monospace;font-size:12.5px;word-break:break-word'><b>after&nbsp; </b>{line(c[r], n[r], True)}</div></div>")
-    st.markdown("".join(H), unsafe_allow_html=True)
+        bc = [i for i in np.flatnonzero(c[r, :C.BARCODE_LEN] != n[r, :C.BARCODE_LEN])]
+        tri = sorted({(i - C.BARCODE_LEN) // 3 for i in np.flatnonzero(c[r] != n[r]) if i >= C.BARCODE_LEN})
+        if bc:
+            b0, b1 = c[r, :C.BARCODE_LEN].tobytes().decode(), n[r, :C.BARCODE_LEN].tobytes().decode()
+            rows.append((r, "barcode", f"<code>{b0}</code>", f"<code>{b1}</code>"))
+        for p in tri:
+            t0 = c[r, C.BARCODE_LEN + 3 * p:C.BARCODE_LEN + 3 * p + 3].tobytes().decode()
+            t1 = n[r, C.BARCODE_LEN + 3 * p:C.BARCODE_LEN + 3 * p + 3].tobytes().decode()
+            rows.append((r, f"position {p}", chip(t0), chip(t1) if t1 in C.OMEGA else f"<span style='{red}'>{t1}</span>"))
+    H = ["<table style='border-collapse:collapse;font-size:14px'><tr><th style='text-align:left;padding:2px 14px'>Molecule</th>"
+         "<th style='text-align:left;padding:2px 14px'>Where</th><th style='text-align:left;padding:2px 14px'>Original</th>"
+         "<th style='text-align:left;padding:2px 14px'>After the error</th></tr>"]
+    for r, where, o, new in rows:
+        H.append(f"<tr style='border-top:1px solid #e3e8ed'><td style='padding:3px 14px'>{r}</td><td style='padding:3px 14px'>{where}</td>"
+                 f"<td style='padding:3px 14px'>{o}</td><td style='padding:3px 14px'>{new}</td></tr>")
+    st.markdown("".join(H) + "</table>", unsafe_allow_html=True)
+    st.caption("Red = the changed trimer is no longer one of the 16 trimers of Omega, so it is recognised as an error.")
 
 
 st.markdown("""<style>
@@ -295,14 +296,10 @@ step(3, "Synthesis: make the molecules")
 rs_choice = st.radio("Error protection across strands", ["With Reed–Solomon (the paper's method)", "Without Reed–Solomon"], horizontal=True,
                      help="With: extra parity strands are added to every group of data strands. Letters that could not be read are rebuilt, so far fewer copies "
                           "are needed. Without: every letter must be read directly, so many more copies are needed.")
-rs_cfg = None
-if rs_choice.startswith("With "):
-    r1, r2 = st.columns(2)
-    rk = r1.slider("Data strands per group (k)", 4, 100, C.RS_K, help="The paper uses 42.")
-    rp = r2.slider("Parity strands per group (p)", 1, 12, C.RS_P, help="The paper uses 6. Up to p unreadable letters per position and group can be rebuilt.")
-    rs_cfg = (rk, rp)
-    st.caption(f"Reed–Solomon RS({rk + rp}, {rk}) over GF(2¹²): every {rk} data strands get {rp} parity strands (+{rp / rk:.0%} strands). "
-               f"In each group, any {rp} unreadable letters at the same position are rebuilt.")
+rs_cfg = C.RS_DEFAULT if rs_choice.startswith("With ") else None
+if rs_cfg:
+    st.caption(f"As in the paper: Reed–Solomon over GF(2¹²), {rs_cfg[1]} parity strands for every {rs_cfg[0]} data strands (+{rs_cfg[1] / rs_cfg[0]:.0%} strands). "
+               f"In each group, any {rs_cfg[1]} unreadable letters at the same position are rebuilt automatically when decoding.")
 s1, s2 = st.columns(2)
 need = next((c for c in range(5, 301) if C.expected_lost(c, n_data, rs_cfg) < 0.05), 300)
 copies = s1.slider("Copies (molecules) per strand", 1, 300, need, key=f"copies_{psha}_{rs_cfg}",
@@ -338,8 +335,7 @@ step(4, "Introduce substitution errors")
 p_sub = st.slider("Substitution error per nucleotide (%)", 0.0, 5.0, 0.1, 0.01, format="%.2f",
                   help="Each base of each molecule is replaced by a different base with this probability.") / 100
 reads, n_changed, qual = get_noisy(ckey, copies, int(seed), p_sub, clean)
-st.caption(f"**{n_changed:,}** of {reads.size:,} bases of all molecules were changed.")
-st.markdown("**Molecules of the strand chosen in Step 3, before and after the errors** (changed bases in red):")
+st.markdown(f"**Strand {sidx} (chosen in Step 3): the molecules that were hit by an error, before and after**")
 diff_view(clean, reads, copies, sidx, nmol)
 meta = dict(name=pname if comp == "none" else oname, bytes=len(payload), sha=psha, comp=comp, rsk=rs_cfg[0] if rs_cfg else 0, rsp=rs_cfg[1] if rs_cfg else 0)
 if comp == "lzma":
