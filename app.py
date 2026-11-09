@@ -10,7 +10,7 @@ import streamlit as st
 import shortmer_core as C
 
 st.set_page_config(page_title="Shortmer DNA Storage", layout="wide")
-if getattr(C, "VERSION", 0) < 8:
+if getattr(C, "VERSION", 0) < 9:
     st.error("shortmer_core.py is outdated. Upload the shortmer_core.py from the latest zip (and delete dna_codec.py / codec.py).")
     st.stop()
 MAX_READS = 200_000          # molecules kept in memory / in one FASTQ download
@@ -141,7 +141,7 @@ def safe_limit(cap: int):
     best = (0, 0)
     for c in range(10, 301):
         n_data = (cap // c) * C.RS_K // (C.RS_K + C.RS_P)
-        if C.expected_lost(c, n_data, True) < 0.1 and n_data * 180 > best[0]:
+        if C.expected_lost(c, n_data, C.RS_DEFAULT) < 0.1 and n_data * 180 > best[0]:
             best = (n_data * 180, c)
     return best
 
@@ -162,6 +162,17 @@ def viewer(reads, letters, copies, sidx, npos, nmol):
         H.append(f"<tr><td style='padding-right:8px'>molecule {k}</td><td><code>{x[:12]}</code></td>" +
                  "".join(f"<td style='padding:2px 8px;border-left:1px solid #ccc'>{chip(x[12 + 3 * i:15 + 3 * i])}</td>" for i in range(npos)) + "</tr>")
     st.markdown("".join(H) + "</table>", unsafe_allow_html=True)
+
+
+st.markdown("""<style>
+.stButton button, .stDownloadButton button {border-radius:10px;padding:.55rem 1.1rem;font-weight:600;border:1px solid #cdd5dd;background:#fff;color:#33414f;
+  box-shadow:0 1px 2px rgba(20,30,40,.08);transition:all .15s ease}
+.stButton button:hover, .stDownloadButton button:hover {border-color:#3d5a80;color:#3d5a80;box-shadow:0 6px 14px rgba(61,90,128,.20);transform:translateY(-1px)}
+.stButton button[data-testid="stBaseButton-primary"] {background:linear-gradient(135deg,#33414f,#3d5a80);color:#fff;border:none;padding:.75rem 2rem;font-size:1.05rem}
+.stButton button[data-testid="stBaseButton-primary"]:hover {color:#fff;filter:brightness(1.12)}
+div[data-testid="stMetric"] {background:#f3f5f7;border:1px solid #e3e8ed;border-radius:12px;padding:.7rem 1rem}
+h2 {border-left:5px solid #3d5a80;padding-left:.7rem}
+</style>""", unsafe_allow_html=True)
 
 
 def step(n, title):
@@ -205,11 +216,11 @@ elif mode.startswith("Shrink"):
     stem = oname.rsplit(".", 1)[0]
     try:
         if kind == "image":
-            side = q1.slider("Longest side (pixels)", 64, 3000, 640); qual = q2.slider("JPEG quality", 5, 95, 40)
-            payload, pname = shrink_image(orig, side, qual), stem + "_small.jpg"
+            side = q1.slider("Longest side (pixels)", 64, 3000, 640); qual_j = q2.slider("JPEG quality", 5, 95, 40)
+            payload, pname = shrink_image(orig, side, qual_j), stem + "_small.jpg"
         elif kind == "audio":
-            kbps = q1.slider("Bitrate (kbit/s)", 8, 128, 24, help="Mono, 22 kHz MP3. Lower = smaller file, worse sound.")
-            payload, pname = shrink_av(orig, oname, "audio", kbps, 0), stem + "_small.mp3"
+            payload, pname = shrink_av(orig, oname, "audio", 32, 0), stem + "_small.mp3"
+            st.caption("Shrunk to MP3 · mono · 22 kHz · 32 kbit/s")
         else:
             width = q1.slider("Video width (pixels)", 96, 1280, 240); crf = q2.slider("Quality loss (CRF, higher = smaller)", 18, 45, 36)
             payload, pname = shrink_av(orig, oname, "video", width, crf), stem + "_small.mp4"
@@ -228,58 +239,63 @@ elif comp == "lzma":
                (" Almost no gain here: this file type is already compressed." if len(payload) > 0.9 * len(orig) else ""))
 cap_bytes, cap_copies = safe_limit(MAX_READS)
 if len(payload) > cap_bytes:
-    st.warning(f"This app can store and exactly recover files up to about **{cap_bytes // 1000} KB** (needs ≈ {cap_copies} copies per strand). "
+    st.warning(f"This app can store and exactly recover files up to about **{cap_bytes // 1000} KB** (with Reed–Solomon, ≈ {cap_copies} copies per strand). "
                f"The file to be stored is {len(payload) // 1000} KB. Use a lossy shrink option above to get below that.")
 b1, b2 = st.columns(2)
 if payload != orig:
-    b1.download_button("Download compressed file", payload, file_name=pname if comp == "none" else pname + ".lzma", on_click="ignore")
+    b1.download_button("Download compressed file", payload, file_name=pname if comp == "none" else pname + ".lzma", on_click="ignore", icon=":material/download:")
 if len(payload) <= 3_000_000:
     b2.download_button("Download bits (0/1 text)", lambda: "".join(map(str, np.unpackbits(np.frombuffer(payload, np.uint8)))).encode(),
-                       file_name=pname + "_bits.txt", on_click="ignore")
+                       file_name=pname + "_bits.txt", on_click="ignore", icon=":material/download:")
 
 letters_data = C.bytes_to_letters(payload)
-letters = letters_data
 n_data = len(letters_data) // C.LPS
 m1, m2, m3 = st.columns(3)
 m1.metric("Letters (12 bits each)", f"{len(letters_data):,}"); m2.metric("Data strands (120 letters)", f"{n_data:,}")
 m3.metric("Bits per nucleotide", f"{C.BITS / 3:.0f}", help="Standard DNA: 2")
-
 with st.expander("The encoding, letter by letter (first letters of the file)", expanded=True):
     bits = np.unpackbits(np.frombuffer(payload[:10], dtype=np.uint8))
-    rows = [{"Position": i, "12 bits": "".join(map(str, np.pad(bits, (0, 96))[12 * i:12 * i + 12])), "Letter number": int(letters[i]),
-             "Letter = 5 trimers": " ".join(C.letter_trimers(int(letters[i]))),
-             "As Omega indices": " ".join(f"X{j + 1}" for j in C.SUBSETS[letters[i]])} for i in range(6)]
+    rows = [{"Position": i, "12 bits": "".join(map(str, np.pad(bits, (0, 96))[12 * i:12 * i + 12])), "Letter number": int(letters_data[i]),
+             "Letter = 5 trimers": " ".join(C.letter_trimers(int(letters_data[i]))),
+             "As Omega indices": " ".join(f"X{j + 1}" for j in C.SUBSETS[letters_data[i]])} for i in range(6)]
     st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch')
     st.markdown("Omega (paper Table 1): " + " ".join(f"<small>X{i + 1}</small>{chip(t)}" for i, t in enumerate(C.OMEGA)), unsafe_allow_html=True)
 
 # ---------------------------------------------------------------- 3 synthesis
 step(3, "Synthesis: make the molecules")
-rs_choice = st.radio("Error protection across strands", ["With Reed–Solomon (the paper's method)", "Without Reed–Solomon"],
-                     help="With: the paper adds 6 parity strands to every 42 data strands (over GF(2^12)). Any 6 letters unreadable at the same position "
-                          "are rebuilt, so far fewer copies are needed (about 14% more strands). Without: no parity strands, so every letter must be read "
-                          "directly and many more copies are needed.", horizontal=True)
-rs = rs_choice.startswith("With ")
+rs_choice = st.radio("Error protection across strands", ["With Reed–Solomon (the paper's method)", "Without Reed–Solomon"], horizontal=True,
+                     help="With: extra parity strands are added to every group of data strands. Letters that could not be read are rebuilt, so far fewer copies "
+                          "are needed. Without: every letter must be read directly, so many more copies are needed.")
+rs_cfg = None
+if rs_choice.startswith("With "):
+    r1, r2 = st.columns(2)
+    rk = r1.slider("Data strands per group (k)", 4, 100, C.RS_K, help="The paper uses 42.")
+    rp = r2.slider("Parity strands per group (p)", 1, 12, C.RS_P, help="The paper uses 6. Up to p unreadable letters per position and group can be rebuilt.")
+    rs_cfg = (rk, rp)
+    st.caption(f"Reed–Solomon RS({rk + rp}, {rk}) over GF(2¹²): every {rk} data strands get {rp} parity strands (+{rp / rk:.0%} strands). "
+               f"In each group, any {rp} unreadable letters at the same position are rebuilt.")
 s1, s2 = st.columns(2)
-need = next((c for c in range(5, 301) if C.expected_lost(c, n_data, rs) < 0.05), 300)
-copies = s1.slider("Copies (molecules) per strand", 1, 300, need, key=f"copies_{psha}_{rs}",
+need = next((c for c in range(5, 301) if C.expected_lost(c, n_data, rs_cfg) < 0.05), 300)
+copies = s1.slider("Copies (molecules) per strand", 1, 300, need, key=f"copies_{psha}_{rs_cfg}",
                    help="Each letter is a mixture of 5 trimers, but each molecule carries only ONE of them at every position, so several copies are needed to see all 5.")
 seed = s2.number_input("Random seed", 0, 10_000, 1,
                        help="The molecules pick their trimers at random. The seed fixes that randomness: the same seed gives exactly the same molecules and errors every time; a different seed gives a different random outcome.")
-letters = C.rs_encode(letters_data) if rs else letters_data
+letters = C.rs_encode(letters_data, rs_cfg) if rs_cfg else letters_data
 n_letters, n_strands = len(letters), len(letters) // C.LPS
 n_reads = n_strands * copies
 miss = C.miss_probability(copies)
-lost = C.expected_lost(copies, n_data, rs)
-st.caption(f"**{n_strands:,}** strands ({n_data:,} data" + (f" + {n_strands - n_data:,} parity" if rs else "") + f") × {copies} copies = **{n_reads:,}** molecules.  "
+lost = C.expected_lost(copies, n_data, rs_cfg)
+st.caption(f"**{n_strands:,}** strands ({n_data:,} data" + (f" + {n_strands - n_data:,} parity" if rs_cfg else "") + f") × {copies} copies = **{n_reads:,}** molecules.  "
            f"A letter misses at least one of its 5 trimers with probability **{miss:.2%}** → about **{miss * n_letters:,.0f}** unreadable letters before repair."
-           + (f"  After Reed–Solomon repair, about **{lost:,.1f}** letter positions are expected to stay lost." if rs else ""))
+           + (f"  After Reed–Solomon repair, about **{lost:,.1f}** letter positions are expected to stay lost." if rs_cfg else ""))
 if lost >= 0.5:
     st.warning(f"With {copies} copies about {lost:,.0f} letters will stay unreadable, so the recovered file will be damaged "
-               f"(an audio/video/image may not play). Use more copies" + ("" if rs else ", turn on Reed–Solomon") + " or a smaller file (Step 2).")
+               f"(an audio/video/image may not play). Use more copies" + ("" if rs_cfg else ", turn on Reed–Solomon") + " or a smaller file (Step 2).")
 if n_reads > MAX_READS:
     st.error(f"{n_reads:,} molecules is more than this app can handle ({MAX_READS:,}). Use Step 2 (shrink) or fewer copies.")
     st.stop()
-clean = get_clean(f"{psha}{int(rs)}", letters, copies, int(seed))
+ckey = f"{psha}{rs_cfg}"
+clean = get_clean(ckey, letters, copies, int(seed))
 v1, v2, v3 = st.columns(3)
 sidx = v1.number_input("Strand number", 0, n_strands - 1, 0)
 npos = v2.slider("Positions to show", 3, 16, 8)
@@ -292,44 +308,64 @@ viewer(clean, letters, copies, sidx, npos, nmol)
 step(4, "Introduce substitution errors")
 p_sub = st.slider("Substitution error per nucleotide (%)", 0.0, 5.0, 0.1, 0.01, format="%.2f",
                   help="Each base of each molecule is replaced by a different base with this probability.") / 100
-reads, n_changed = get_noisy(f"{psha}{int(rs)}", copies, int(seed), p_sub, clean)
-st.caption(f"**{n_changed:,}** of {reads.size:,} bases changed. Red chips = the trimer is no longer in Omega.")
+reads, n_changed, qual = get_noisy(ckey, copies, int(seed), p_sub, clean)
+st.caption(f"**{n_changed:,}** of {reads.size:,} bases changed. Red chips = the trimer is no longer in Omega. "
+           f"The FASTQ also carries quality (Q) scores: the simulated sequencer gives a low Q to {int(C.SEQ_FLAGS_ERRORS * 100)}% of its wrong bases.")
 if p_sub > 0:
     viewer(reads, letters, copies, sidx, npos, nmol)
-meta = dict(name=pname if comp == "none" else oname, bytes=len(payload), sha=psha, comp=comp, rs=int(rs))
+meta = dict(name=pname if comp == "none" else oname, bytes=len(payload), sha=psha, comp=comp, rsk=rs_cfg[0] if rs_cfg else 0, rsp=rs_cfg[1] if rs_cfg else 0)
 if comp == "lzma":
     meta["orig"] = sha16(orig)
 d1, d2, d3 = st.columns(3)
-mb = len(reads) * (2 * C.READ_LEN + 120) / 1e6
-d1.download_button(f"Download FASTQ ({mb:,.0f} MB)", lambda: C.to_fastq(reads, copies, meta), file_name="encoded.fastq",
-                   mime="text/plain", on_click="ignore", help="The molecules (with these errors). Edit it by hand if you like, then upload it in Step 5.")
-d2.download_button("Download CSV: molecules", lambda: C.to_molecule_csv(reads, copies), file_name="molecules.csv",
-                   mime="text/csv", on_click="ignore", help="One row per molecule, trimers separated by spaces.")
+mb = len(reads) * (2 * C.READ_LEN + 140) / 1e6
+d1.download_button(f"Download FASTQ ({mb:,.0f} MB)", lambda: C.to_fastq(reads, copies, meta, qual), file_name="encoded.fastq", mime="text/plain",
+                   on_click="ignore", icon=":material/download:", help="The molecules (with these errors and quality scores). Edit it by hand if you like, then upload it in Step 5.")
+d2.download_button("Download CSV: molecules", lambda: C.to_molecule_csv(reads, copies), file_name="molecules.csv", mime="text/csv",
+                   on_click="ignore", icon=":material/table:", help="One row per molecule, trimers separated by spaces.")
 if n_letters <= 300_000:
-    d3.download_button("Download CSV: encoding table", lambda: C.to_letter_csv(letters), file_name="encoding_table.csv",
-                       mime="text/csv", on_click="ignore")
+    d3.download_button("Download CSV: encoding table", lambda: C.to_letter_csv(letters), file_name="encoding_table.csv", mime="text/csv",
+                       on_click="ignore", icon=":material/table:")
 
 # ---------------------------------------------------------------- 5 decode
 step(5, "Decode")
 src = st.radio("Molecules to decode", ["Use the molecules from Step 4 (no upload needed)", "Upload a FASTQ file (for example the downloaded one, edited by hand)"])
-correct = st.checkbox("Error-correcting decoder", True,
-                      help="ON: barcode repaired, reads with a trimer outside Omega are ignored, the 5 most frequent trimers form the letter. "
-                           "OFF: any unexpected trimer makes the letter unreadable.")
-reads_in, dmeta, dropped = None, {}, 0
+reads_in, dqual, dmeta, dropped, fq = None, None, {}, 0, None
 if src.startswith("Use"):
-    reads_in, dmeta = reads, meta
+    reads_in, dqual, dmeta = reads, qual, meta
 else:
     fq = st.file_uploader("FASTQ (.fastq or .fastq.gz)", key="fq")
     if fq is not None:
-        reads_in, dmeta, dropped = C.parse_fastq(fq.getvalue())
+        reads_in, dqual, dmeta, dropped = C.parse_fastq(fq.getvalue())
         if len(reads_in) == 0:
             st.error("No reads of the expected length (372 nt) found."); reads_in = None
-key = (psha, rs, copies, int(seed), p_sub, correct, src[:3], getattr(fq, "file_id", None) if not src.startswith("Use") else None)
-if reads_in is not None and st.button("Decode", type="primary"):
+rs_dec = (int(dmeta.get("rsk", 0)), int(dmeta.get("rsp", 0))) if int(dmeta.get("rsk", 0) or 0) > 0 else None
+with st.expander("Decoder settings - switch each correction on or off", expanded=True):
+    g1, g2 = st.columns(2)
+    barcode_check = g1.toggle("Barcode parity check", True, help="The last barcode nucleotide is a parity check, so one wrong base in a barcode is detected and that read is dropped.")
+    ignore_garbage = g1.toggle("Ignore trimers outside Ω (distance-2 check)", True,
+                               help="Ω has minimum Hamming distance 2, so one substitution never gives another trimer of Ω. Such reads are recognised as errors and ignored. "
+                                    "Off: a single bad read makes the whole letter unreadable.")
+    consensus = g1.toggle("Remove reads that disagree with their strand", True,
+                          help="A read whose barcode got two errors can end up under a wrong strand. It disagrees with that strand at most positions, so it is removed.")
+    majority = g2.toggle("Majority vote (5 most-voted trimers)", True,
+                         help="The letter is the 5 trimers with the most reads; a tie for 5th place is called unreadable. Off: exactly 5 different trimers must be seen.")
+    min_support = g2.slider("Minimum reads for a trimer to count", 1, 5, 1, disabled=not majority,
+                            help="Trimers seen fewer times than this are ignored (a stray read cannot win). Too high loses real trimers.")
+    qmin = g2.slider("Q-score filter: ignore bases below Q", 0, 40, 10 if dqual is not None else 0, disabled=dqual is None,
+                     help="Sequencers report a quality (Q) for every base. Bases with a low Q are likely errors and are not used. 0 = off.")
+    rs_use = st.toggle("Reed–Solomon repair", rs_dec is not None, disabled=rs_dec is None,
+                       help="Rebuilds the letters that could not be read from the parity strands. Only possible if the data was encoded with Reed–Solomon.")
+    if rs_dec is None:
+        st.caption("This data was encoded without Reed–Solomon, so there is nothing to repair with.")
+    elif dqual is None:
+        st.caption("The FASTQ has no usable quality scores, so the Q filter is off.")
+settings = (barcode_check, ignore_garbage, consensus, majority, min_support, qmin, rs_use)
+key = (psha, rs_cfg, copies, int(seed), p_sub, settings, src[:3], getattr(fq, "file_id", None))
+if reads_in is not None and st.button("Decode", type="primary", icon=":material/play_arrow:"):
     with st.spinner("Decoding..."):
-        let, stt = C.decode_reads(reads_in, dmeta.get("bytes"), correct, str(dmeta.get("rs", "0")) == "1")
+        let, stt = C.decode_reads(reads_in, dmeta.get("bytes"), rs_dec, rs_use, barcode_check, ignore_garbage, majority, min_support, consensus, dqual, qmin)
         nb = dmeta.get("bytes") or len(let) * C.BITS // 8
-        st.session_state["dec"] = dict(out=C.letters_to_bytes(let, nb), stt=stt, meta=dmeta, dropped=dropped, correct=correct, key=key)
+        st.session_state["dec"] = dict(out=C.letters_to_bytes(let, nb), stt=stt, meta=dmeta, dropped=dropped, rs=rs_dec, key=key)
 dec = st.session_state.get("dec")
 if dec and dec["key"] == key:
     stt, dm, out = dec["stt"], dec["meta"], dec["out"]
@@ -339,35 +375,49 @@ if dec and dec["key"] == key:
     a, b, c, d = st.columns(4)
     a.metric("Molecules read", f"{stt['reads_in']:,}", f"-{dec['dropped']:,} wrong length" if dec["dropped"] else None, delta_color="off")
     b.metric("Reads dropped (bad barcode)", f"{stt['bad_barcode']:,}")
-    c.metric("Trimer reads ignored (not in Omega)", f"{stt['ignored_trimers']:,}" if dec["correct"] else "n/a")
+    c.metric("Trimer reads ignored", f"{stt['ignored_trimers']:,}", help="Not in Omega, or low Q score")
     d.metric("Unreadable letters (before repair)", f"{stt['unreadable_letters']:,} / {stt['letters']:,}")
-    if str(dm.get("rs", "0")) == "1":
+    if dec["rs"]:
         e1, e2 = st.columns(2)
         e1.metric("Rebuilt by Reed–Solomon", f"{stt['rs_recovered']:,}")
         e2.metric("Still unreadable (final)", f"{stt['still_unreadable']:,}")
-    if src.startswith("Use") and dec["correct"]:
-        st.caption(f"About **{C.miss_probability(copies) * stt['letters']:,.0f}** unreadable letters are expected from the number of copies alone "
-                   f"({copies} copies), independent of the error rate.")
-    st.caption(f"Strands with no molecule: {stt['strands_missing']:,} · unreadable letters are written as zeros.")
+    st.caption(f"Reads removed as misplaced: {stt['misplaced_reads']:,} · strands with no molecule: {stt['strands_missing']:,} · unreadable letters are written as zeros.")
 
-    # ------------------------------------------------------------ 6 decompress + preview
-    step(6, "Decompress and compare")
-    final, fname = out, dm.get("name", "decoded.bin")
+    # ------------------------------------------------------------ 6 compare
+    step(6, "Compare: original, compressed, recovered")
+    dname = dm.get("name", "decoded.bin")
+    final, fname = out, dname
+    panels = []
+    if dm.get("sha") == psha:
+        panels.append(("Original", orig, oname, None))
+        if payload != orig:
+            panels.append(("Compressed (stored in DNA)", payload, pname if comp == "none" else pname + ".lzma",
+                           "Compressed bytes, not viewable." if comp == "lzma" else None))
+    decoded_note = None
+    if dm.get("comp") == "lzma":
+        decoded_name = dname + ".lzma"; decoded_note = "Compressed bytes, not viewable."
+    else:
+        decoded_name = dname
+    panels.append(("Decoded from DNA", out, decoded_name, decoded_note))
     if dm.get("comp") == "lzma":
         try:
-            final = lzma.decompress(out)
+            final, fname = lzma.decompress(out), dname
+            panels.append(("Decompressed", final, fname, None))
             st.success(f"Decompressed: {len(out):,} → {len(final):,} bytes" +
                        (" (matches the original checksum)" if dm.get("orig") == sha16(final) else " (checksum does NOT match the original)"))
         except Exception:
-            st.error("The compressed data is damaged and cannot be decompressed (too many unreadable letters). Showing the raw bytes instead.")
-            fname = fname + ".lzma"
+            st.error("The compressed data is damaged and cannot be decompressed (too many unreadable letters).")
     if not same:
-        st.warning("The recovered file is damaged, so a player may refuse to open it. Fix: more copies, fewer errors, or a smaller file.")
-    p1, p2 = st.columns(2)
-    with p1:
-        st.subheader("Original"); preview(orig, oname); meta_table(oname, orig)
-    with p2:
-        st.subheader("Recovered"); preview(final, fname); meta_table(fname, final)
-    st.download_button("Download recovered file", final, file_name="recovered_" + fname, on_click="ignore")
-    if dm.get("comp") == "none" and mode.startswith("Shrink") and src.startswith("Use"):
-        st.caption("The recovered file is the shrunk picture from Step 2 (lossy shrinking cannot be undone), so it looks smaller than the original.")
+        st.warning("The recovered file is damaged, so a player may refuse to open it. Fix: more copies, Reed–Solomon, fewer errors, or a smaller file.")
+    cols = st.columns(len(panels))
+    for col, (title, data_, name_, note) in zip(cols, panels):
+        with col:
+            st.subheader(title)
+            if note:
+                st.info(note)
+            else:
+                preview(data_, name_)
+            meta_table(name_, data_)
+    if dm.get("comp") == "none" and mode.startswith("Shrink") and dm.get("sha") == psha:
+        st.caption("Lossy shrinking cannot be undone, so the decoded file is the shrunk one: there is no decompress step to get the original quality back.")
+    st.download_button("Download recovered file", final, file_name="recovered_" + fname, on_click="ignore", icon=":material/download:")
