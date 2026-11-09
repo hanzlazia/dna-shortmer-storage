@@ -164,6 +164,35 @@ def viewer(reads, letters, copies, sidx, npos, nmol):
     st.markdown("".join(H) + "</table>", unsafe_allow_html=True)
 
 
+def diff_view(clean, noisy, copies, sidx, nmol):
+    """Molecules of one strand that were hit by errors: the original and the version after the errors, changed bases in red."""
+    c, n = clean[sidx * copies:(sidx + 1) * copies], noisy[sidx * copies:(sidx + 1) * copies]
+    hit = np.flatnonzero((c != n).any(axis=1))
+    if len(hit) == 0:
+        st.info("No molecule of this strand was hit by an error. Try another strand number, or raise the error rate.")
+        return
+    st.caption(f"{len(hit)} of {copies} molecules of strand {sidx} contain at least one error (showing {min(nmol, len(hit))}).")
+
+    def line(row_c, row_n, show_new):
+        out = []
+        for i in range(C.READ_LEN):
+            ch = (row_n if show_new else row_c)[i:i + 1].tobytes().decode()
+            if row_c[i] != row_n[i]:
+                ch = f"<span style='background:#f4b6b6;color:#a00;font-weight:700;border-radius:3px'>{ch}</span>"
+            out.append(ch)
+            if i == C.BARCODE_LEN - 1 or (i >= C.BARCODE_LEN and (i - C.BARCODE_LEN) % 3 == 2):
+                out.append(" ")
+        return "".join(out)
+
+    H = []
+    for r in hit[:nmol]:
+        H.append(f"<div style='margin:6px 0 12px 0'><div style='font-size:12px;color:#556'>molecule {r}: "
+                 f"{int((c[r] != n[r]).sum())} base(s) changed</div>"
+                 f"<div style='font-family:monospace;font-size:12.5px;word-break:break-word'><b>before </b>{line(c[r], n[r], False)}</div>"
+                 f"<div style='font-family:monospace;font-size:12.5px;word-break:break-word'><b>after&nbsp; </b>{line(c[r], n[r], True)}</div></div>")
+    st.markdown("".join(H), unsafe_allow_html=True)
+
+
 st.markdown("""<style>
 .stButton button, .stDownloadButton button {border-radius:10px;padding:.55rem 1.1rem;font-weight:600;border:1px solid #cdd5dd;background:#fff;color:#33414f;
   box-shadow:0 1px 2px rgba(20,30,40,.08);transition:all .15s ease}
@@ -309,17 +338,16 @@ step(4, "Introduce substitution errors")
 p_sub = st.slider("Substitution error per nucleotide (%)", 0.0, 5.0, 0.1, 0.01, format="%.2f",
                   help="Each base of each molecule is replaced by a different base with this probability.") / 100
 reads, n_changed, qual = get_noisy(ckey, copies, int(seed), p_sub, clean)
-st.caption(f"**{n_changed:,}** of {reads.size:,} bases changed. Red chips = the trimer is no longer in Omega. "
-           f"The FASTQ also carries quality (Q) scores: the simulated sequencer gives a low Q to {int(C.SEQ_FLAGS_ERRORS * 100)}% of its wrong bases.")
-if p_sub > 0:
-    viewer(reads, letters, copies, sidx, npos, nmol)
+st.caption(f"**{n_changed:,}** of {reads.size:,} bases of all molecules were changed.")
+st.markdown("**Molecules of the strand chosen in Step 3, before and after the errors** (changed bases in red):")
+diff_view(clean, reads, copies, sidx, nmol)
 meta = dict(name=pname if comp == "none" else oname, bytes=len(payload), sha=psha, comp=comp, rsk=rs_cfg[0] if rs_cfg else 0, rsp=rs_cfg[1] if rs_cfg else 0)
 if comp == "lzma":
     meta["orig"] = sha16(orig)
 d1, d2, d3 = st.columns(3)
 mb = len(reads) * (2 * C.READ_LEN + 140) / 1e6
-d1.download_button(f"Download FASTQ ({mb:,.0f} MB)", lambda: C.to_fastq(reads, copies, meta, qual), file_name="encoded.fastq", mime="text/plain",
-                   on_click="ignore", icon=":material/download:", help="The molecules (with these errors and quality scores). Edit it by hand if you like, then upload it in Step 5.")
+d1.download_button(f"Download FASTQ ({mb:,.0f} MB)", lambda: C.to_fastq(reads, copies, meta), file_name="encoded.fastq", mime="text/plain",
+                   on_click="ignore", icon=":material/download:", help="The molecules (with these errors). Edit it by hand if you like, then upload it in Step 5.")
 d2.download_button("Download CSV: molecules", lambda: C.to_molecule_csv(reads, copies), file_name="molecules.csv", mime="text/csv",
                    on_click="ignore", icon=":material/table:", help="One row per molecule, trimers separated by spaces.")
 if n_letters <= 300_000:
@@ -339,31 +367,14 @@ else:
         if len(reads_in) == 0:
             st.error("No reads of the expected length (372 nt) found."); reads_in = None
 rs_dec = (int(dmeta.get("rsk", 0)), int(dmeta.get("rsp", 0))) if int(dmeta.get("rsk", 0) or 0) > 0 else None
-with st.expander("Decoder settings - switch each correction on or off", expanded=True):
-    g1, g2 = st.columns(2)
-    barcode_check = g1.toggle("Barcode parity check", True, help="The last barcode nucleotide is a parity check, so one wrong base in a barcode is detected and that read is dropped.")
-    ignore_garbage = g1.toggle("Ignore trimers outside Ω (distance-2 check)", True,
-                               help="Ω has minimum Hamming distance 2, so one substitution never gives another trimer of Ω. Such reads are recognised as errors and ignored. "
-                                    "Off: a single bad read makes the whole letter unreadable.")
-    consensus = g1.toggle("Remove reads that disagree with their strand", True,
-                          help="A read whose barcode got two errors can end up under a wrong strand. It disagrees with that strand at most positions, so it is removed.")
-    majority = g2.toggle("Majority vote (5 most-voted trimers)", True,
-                         help="The letter is the 5 trimers with the most reads; a tie for 5th place is called unreadable. Off: exactly 5 different trimers must be seen.")
-    min_support = g2.slider("Minimum reads for a trimer to count", 1, 5, 1, disabled=not majority,
-                            help="Trimers seen fewer times than this are ignored (a stray read cannot win). Too high loses real trimers.")
-    qmin = g2.slider("Q-score filter: ignore bases below Q", 0, 40, 10 if dqual is not None else 0, disabled=dqual is None,
-                     help="Sequencers report a quality (Q) for every base. Bases with a low Q are likely errors and are not used. 0 = off.")
-    rs_use = st.toggle("Reed–Solomon repair", rs_dec is not None, disabled=rs_dec is None,
-                       help="Rebuilds the letters that could not be read from the parity strands. Only possible if the data was encoded with Reed–Solomon.")
-    if rs_dec is None:
-        st.caption("This data was encoded without Reed–Solomon, so there is nothing to repair with.")
-    elif dqual is None:
-        st.caption("The FASTQ has no usable quality scores, so the Q filter is off.")
-settings = (barcode_check, ignore_garbage, consensus, majority, min_support, qmin, rs_use)
-key = (psha, rs_cfg, copies, int(seed), p_sub, settings, src[:3], getattr(fq, "file_id", None))
+if rs_dec is None:
+    st.caption("Decoding: the trimers seen at every position give the letter. No Reed–Solomon was used for this data.")
+else:
+    st.caption(f"Decoding: the trimers seen at every position give the letter, then Reed–Solomon RS({rs_dec[0] + rs_dec[1]}, {rs_dec[0]}) rebuilds letters that could not be read.")
+key = (psha, rs_cfg, copies, int(seed), p_sub, src[:3], getattr(fq, "file_id", None))
 if reads_in is not None and st.button("Decode", type="primary", icon=":material/play_arrow:"):
     with st.spinner("Decoding..."):
-        let, stt = C.decode_reads(reads_in, dmeta.get("bytes"), rs_dec, rs_use, barcode_check, ignore_garbage, majority, min_support, consensus, dqual, qmin)
+        let, stt = C.decode_reads(reads_in, dmeta.get("bytes"), rs_dec)
         nb = dmeta.get("bytes") or len(let) * C.BITS // 8
         st.session_state["dec"] = dict(out=C.letters_to_bytes(let, nb), stt=stt, meta=dmeta, dropped=dropped, rs=rs_dec, key=key)
 dec = st.session_state.get("dec")
@@ -374,14 +385,10 @@ if dec and dec["key"] == key:
                                       "Recovered bytes differ from what was written (or the FASTQ header has no checksum).")
     a, b, c, d = st.columns(4)
     a.metric("Molecules read", f"{stt['reads_in']:,}", f"-{dec['dropped']:,} wrong length" if dec["dropped"] else None, delta_color="off")
-    b.metric("Reads dropped (bad barcode)", f"{stt['bad_barcode']:,}")
-    c.metric("Trimer reads ignored", f"{stt['ignored_trimers']:,}", help="Not in Omega, or low Q score")
-    d.metric("Unreadable letters (before repair)", f"{stt['unreadable_letters']:,} / {stt['letters']:,}")
-    if dec["rs"]:
-        e1, e2 = st.columns(2)
-        e1.metric("Rebuilt by Reed–Solomon", f"{stt['rs_recovered']:,}")
-        e2.metric("Still unreadable (final)", f"{stt['still_unreadable']:,}")
-    st.caption(f"Reads removed as misplaced: {stt['misplaced_reads']:,} · strands with no molecule: {stt['strands_missing']:,} · unreadable letters are written as zeros.")
+    b.metric("Unreadable letters (before repair)", f"{stt['unreadable_letters']:,} / {stt['letters']:,}")
+    c.metric("Rebuilt by Reed–Solomon", f"{stt['rs_recovered']:,}" if dec["rs"] else "n/a")
+    d.metric("Still unreadable (final)", f"{stt['still_unreadable']:,}")
+    st.caption("Unreadable letters are written as zeros.")
 
     # ------------------------------------------------------------ 6 compare
     step(6, "Compare: original, compressed, recovered")
