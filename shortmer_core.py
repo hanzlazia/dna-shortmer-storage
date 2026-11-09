@@ -10,6 +10,7 @@ import numpy as np
 
 OMEGA = ["AAT", "ACA", "ATG", "AGC", "TAA", "TCT", "TTC", "TGG",
          "GAG", "GCC", "GTT", "GGA", "CAC", "CCG", "CTA", "CGT"]      # Table 1: X1..X16
+VERSION = 8
 N, K, BITS = 16, 5, 12
 LETTERS_PER_STRAND, BARCODE_LEN = 120, 12
 

@@ -7,9 +7,12 @@ import mimetypes
 import numpy as np
 import pandas as pd
 import streamlit as st
-import dna_codec as C
+import shortmer_core as C
 
 st.set_page_config(page_title="Shortmer DNA Storage", layout="wide")
+if getattr(C, "VERSION", 0) < 8:
+    st.error("shortmer_core.py is outdated. Upload the shortmer_core.py from the latest zip (and delete dna_codec.py / codec.py).")
+    st.stop()
 MAX_READS = 200_000          # molecules kept in memory / in one FASTQ download
 
 # ------------------------------------------------------------------ small helpers / drawings
